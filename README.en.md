@@ -2,7 +2,7 @@
 
 # GPT Dialogue Extractor
 
-A browser extension for exporting the current ChatGPT / Gemini conversation.
+A browser extension for exporting the current ChatGPT / Gemini / DeepSeek conversation.
 It reads the rendered conversation directly from the web page and exports it to local files.
 
 <p>
@@ -27,6 +27,7 @@ It reads the rendered conversation directly from the web page and exports it to 
 - Select which messages to export
 - Extract ChatGPT web conversations
 - Extract Gemini web conversations
+- Extract DeepSeek web conversations
 - Export code blocks
 - Export common formulas
 - Right-side user-message timeline with hover preview and jump navigation
@@ -59,6 +60,8 @@ Open any supported conversation page:
 - `https://chat.openai.com/*`
 - `https://gemini.google.com/*`
 - `https://bard.google.com/*`
+- `https://chat.deepseek.com/*`
+- `https://www.deepseek.com/*`
 
 The extension injects itself automatically.
 
@@ -160,7 +163,7 @@ If you change the extension code, do these three steps:
 
 1. run `npm run build`
 2. refresh the extension in the extensions page
-3. refresh the ChatGPT tab itself
+3. refresh the relevant ChatGPT, Gemini, or DeepSeek tab itself
 
 Otherwise the browser may still be running an older content script.
 
@@ -184,4 +187,4 @@ Related docs:
 - Table export is not yet high fidelity
 - PDF currently prioritizes reliable export over exact visual reproduction
 
-If your goal is to reliably export the current ChatGPT conversation to local files, this version is already usable.
+If your goal is to reliably export the current ChatGPT, Gemini, or DeepSeek conversation to local files, this version is already usable.

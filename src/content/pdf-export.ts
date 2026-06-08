@@ -130,7 +130,10 @@
   }
 
   function getMessageDisplayName(message) {
-    return `${message.role === "user" ? "user" : message.assistantLabel || "gpt"}${message.index}`;
+    const assistantLabel =
+      message.assistantLabel ||
+      (message.platform === "gemini" ? "gemini" : message.platform === "deepseek" ? "deepseek" : "gpt");
+    return `${message.role === "user" ? "user" : assistantLabel}${message.index}`;
   }
 
   function renderConversationPdfPages(conversation) {

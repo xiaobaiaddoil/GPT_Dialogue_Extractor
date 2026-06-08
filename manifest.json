@@ -3,7 +3,7 @@
   "name": "GPT Dialogue Extractor",
   "short_name": "GPT Extractor",
   "version": "0.2.0",
-  "description": "Export the current ChatGPT or Gemini conversation as JSON, Markdown, PDF, or ZIP from the live page DOM.",
+  "description": "Export ChatGPT, Gemini, or DeepSeek conversations as JSON, Markdown, PDF, or ZIP from the live page DOM.",
   "permissions": ["downloads"],
   "background": {
     "service_worker": "src/background/index.js"
@@ -12,7 +12,9 @@
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
     "https://gemini.google.com/*",
-    "https://bard.google.com/*"
+    "https://bard.google.com/*",
+    "https://chat.deepseek.com/*",
+    "https://www.deepseek.com/*"
   ],
   "content_scripts": [
     {
@@ -20,7 +22,9 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
         "https://gemini.google.com/*",
-        "https://bard.google.com/*"
+        "https://bard.google.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.deepseek.com/*"
       ],
       "js": [
         "src/content/binary-utils.js",
@@ -44,7 +48,9 @@
         "https://chatgpt.com/*",
         "https://chat.openai.com/*",
         "https://gemini.google.com/*",
-        "https://bard.google.com/*"
+        "https://bard.google.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.deepseek.com/*"
       ]
     }
   ]

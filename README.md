@@ -2,7 +2,7 @@
 
 # GPT Dialogue Extractor
 
-一个用于导出 ChatGPT / Gemini 当前会话的浏览器扩展。
+一个用于导出 ChatGPT / Gemini / DeepSeek 当前会话的浏览器扩展。
 直接读取网页中已经渲染完成的对话内容，并导出为本地文件。
 
 <p>
@@ -27,6 +27,7 @@
 - 按消息勾选导出范围
 - 支持 ChatGPT 网页版会话提取
 - 支持 Gemini 网页版会话提取
+- 支持 DeepSeek 网页版会话提取
 - 支持代码块导出
 - 支持常见公式导出
 - 右侧用户消息时间轴，支持悬浮预览和点击跳转
@@ -59,6 +60,8 @@
 - `https://chat.openai.com/*`
 - `https://gemini.google.com/*`
 - `https://bard.google.com/*`
+- `https://chat.deepseek.com/*`
+- `https://www.deepseek.com/*`
 
 扩展会自动注入到页面里。
 
@@ -160,7 +163,7 @@ npm run build
 
 1. 先运行 `npm run build`
 2. 在扩展管理页刷新扩展
-3. 回到 ChatGPT 页面刷新标签页
+3. 回到对应的 ChatGPT、Gemini 或 DeepSeek 页面刷新标签页
 
 否则浏览器可能还在运行旧版 content script。
 
@@ -184,4 +187,4 @@ npm run build
 - 表格导出还不是高保真版本
 - PDF 目前优先保证稳定导出，不追求完全还原页面样式
 
-如果你的目标是稳定地把当前 ChatGPT 会话导出为本地文件，这个版本已经可以直接使用。
+如果你的目标是稳定地把当前 ChatGPT、Gemini 或 DeepSeek 会话导出为本地文件，这个版本已经可以直接使用。
