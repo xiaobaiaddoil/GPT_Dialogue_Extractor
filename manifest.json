@@ -31,8 +31,10 @@
         "src/content/download-bridge.js",
         "src/content/index.js"
       ],
-      "css": ["src/content/styles.css"],
-      "run_at": "document_idle"
+      "css": [
+        "src/content/styles.css"
+      ],
+      "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [

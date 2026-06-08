@@ -101,6 +101,7 @@
   const CLEAR_ALL_ID = "cge-clear-all";
   const SELECTION_SUMMARY_ID = "cge-selection-summary";
   const MESSAGE_LIST_ID = "cge-message-list";
+  const TIMELINE_ENABLED = true;
   const TIMELINE_SCROLL_PADDING = 12;
   const TIMELINE_MIN_TOP_CLEARANCE = 96;
   const TIMELINE_ACTIVE_LOCK_MS = 1200;
@@ -121,8 +122,16 @@
   let currentTimelineScroller = null;
   let timelineScrollFrame = 0;
   let timelineRefreshTimer = 0;
+  let timelineSettledRefreshTimers = [];
+  let fullConversationLoadPromise = null;
+  let fullConversationLoadUrl = "";
+  let fullConversationLoadedUrl = "";
+  let domHistoryLoadPromise = null;
+  let domHistoryLoadUrl = "";
+  let domHistoryLoadedUrl = "";
   let lastSelectionSignature = "";
   let lastTimelineSignature = "";
+  let lastConversationUrl = "";
   let timelineLockedMessageId = "";
   let timelineLockedUntil = 0;
   let timelineDirectoryExpanded = false;
@@ -200,7 +209,635 @@
       return "";
     }
 
-    return conversation.messages.map((message) => message.id).join("|");
+    const url = (conversation.metadata && conversation.metadata.url) || window.location.href;
+    return [
+      url,
+      ...conversation.messages.map((message) => {
+        const text = normalizeWhitespace(message.text || message.markdown || "").slice(0, 120);
+        const assetCount = Array.isArray(message.assets) ? message.assets.length : 0;
+        return `${message.id}:${message.role}:${message.index}:${text}:${assetCount}`;
+      }),
+    ].join("|");
+  }
+
+  function getMessageTurnOrder(message, fallbackIndex) {
+    if (typeof message.sequenceIndex === "number" && Number.isFinite(message.sequenceIndex)) {
+      return message.sequenceIndex;
+    }
+
+    const rawId = `${message.turnId || ""}:${message.id || ""}`;
+    const match = rawId.match(/conversation-turn-(\d+)/);
+    return match ? Number.parseInt(match[1], 10) : fallbackIndex + 1;
+  }
+
+  function getMessageRoleOrder(message) {
+    return message.role === "user" ? 0 : 1;
+  }
+
+  function normalizeConversationMessageOrder(conversation) {
+    if (!conversation || !Array.isArray(conversation.messages)) {
+      return conversation;
+    }
+
+    let userMessageIndex = 0;
+    let assistantMessageIndex = 0;
+    const messages = conversation.messages
+      .map((message, fallbackIndex) => ({
+        message,
+        fallbackIndex,
+        turnOrder: getMessageTurnOrder(message, fallbackIndex),
+        roleOrder: getMessageRoleOrder(message),
+      }))
+      .sort(
+        (left, right) =>
+          left.turnOrder - right.turnOrder ||
+          left.roleOrder - right.roleOrder ||
+          left.fallbackIndex - right.fallbackIndex,
+      )
+      .map(({ message }) => {
+        const nextIndex = message.role === "user" ? (userMessageIndex += 1) : (assistantMessageIndex += 1);
+        return {
+          ...message,
+          index: nextIndex,
+        };
+      });
+
+    return {
+      ...conversation,
+      metadata: {
+        ...(conversation.metadata || {}),
+        url: (conversation.metadata && conversation.metadata.url) || window.location.href,
+        messageCount: messages.length,
+      },
+      messages,
+    };
+  }
+
+  function getMessageBackendId(message) {
+    if (!message || typeof message !== "object") {
+      return "";
+    }
+
+    if (typeof message.backendMessageId === "string" && message.backendMessageId) {
+      return message.backendMessageId;
+    }
+
+    const role = typeof message.role === "string" ? message.role : "";
+    const id = typeof message.id === "string" ? message.id : "";
+    const suffix = role ? `:${role}` : "";
+    return suffix && id.endsWith(suffix) ? id.slice(0, -suffix.length) : "";
+  }
+
+  function getMessageDomTurnIds(message) {
+    if (!message || typeof message !== "object") {
+      return [];
+    }
+
+    return Array.from(
+      new Set(
+        [message.backendNodeId, message.turnNodeId, message.backendMessageId, getMessageBackendId(message), message.turnId]
+          .filter((value) => typeof value === "string" && value)
+          .map((value) => value.trim())
+          .filter(Boolean),
+      ),
+    );
+  }
+  function getMessageLookupText(message) {
+    if (!message || typeof message !== "object") {
+      return "";
+    }
+
+    return normalizeWhitespace(message.text || message.markdown || "");
+  }
+
+  function getMessageTextMergeKey(message) {
+    const text = getMessageLookupText(message);
+    if (!text) {
+      return "";
+    }
+
+    const turnOrder = getMessageTurnOrder(message, -1);
+    const orderPart = turnOrder >= 0 ? `:${turnOrder}` : "";
+    return `text:${message.role || ""}${orderPart}:${text.slice(0, 600)}`;
+  }
+
+  function mergeAssetLists(previousAssets, nextAssets) {
+    const assets = [];
+    const seen = new Set();
+
+    [...(previousAssets || []), ...(nextAssets || [])].forEach((asset) => {
+      if (!asset || typeof asset !== "object") {
+        return;
+      }
+
+      const key = [
+        asset.kind || "",
+        normalizeWhitespace(asset.url || ""),
+        normalizeWhitespace(asset.filename || ""),
+        normalizeWhitespace(asset.error || ""),
+      ].join("|");
+      if (seen.has(key)) {
+        return;
+      }
+
+      seen.add(key);
+      assets.push(asset);
+    });
+
+    return assets;
+  }
+
+  function mergeConversationMessage(previousMessage, nextMessage) {
+    if (!previousMessage) {
+      return nextMessage;
+    }
+    if (!nextMessage) {
+      return previousMessage;
+    }
+
+    const previousSequence =
+      typeof previousMessage.sequenceIndex === "number" && Number.isFinite(previousMessage.sequenceIndex)
+        ? previousMessage.sequenceIndex
+        : null;
+    const nextSequence =
+      typeof nextMessage.sequenceIndex === "number" && Number.isFinite(nextMessage.sequenceIndex)
+        ? nextMessage.sequenceIndex
+        : null;
+    const backendSequence =
+      previousMessage.sequenceSource === "backend" && previousSequence !== null
+        ? previousSequence
+        : nextMessage.sequenceSource === "backend" && nextSequence !== null
+          ? nextSequence
+          : null;
+    const turnId =
+      nextMessage.sequenceSource === "backend" && previousMessage.turnId
+        ? previousMessage.turnId
+        : nextMessage.turnId || previousMessage.turnId || "";
+
+    return {
+      ...previousMessage,
+      ...nextMessage,
+      backendMessageId: getMessageBackendId(nextMessage) || getMessageBackendId(previousMessage),
+      backendNodeId: nextMessage.backendNodeId || previousMessage.backendNodeId || "",
+      turnNodeId: nextMessage.turnNodeId || previousMessage.turnNodeId || "",
+      turnId,
+      sequenceIndex: backendSequence !== null ? backendSequence : nextSequence !== null ? nextSequence : previousSequence,
+      sequenceSource: backendSequence !== null ? "backend" : nextMessage.sequenceSource || previousMessage.sequenceSource || "",
+      text: nextMessage.text || previousMessage.text || "",
+      markdown: nextMessage.markdown || previousMessage.markdown || nextMessage.text || previousMessage.text || "",
+      html: nextMessage.html || previousMessage.html || "",
+      assets: mergeAssetLists(previousMessage.assets, nextMessage.assets),
+    };
+  }
+
+  function mergeConversationFragments(previousConversation, visibleConversation) {
+    if (!visibleConversation || !Array.isArray(visibleConversation.messages)) {
+      return normalizeConversationMessageOrder(previousConversation);
+    }
+
+    const previousUrl = previousConversation && previousConversation.metadata && previousConversation.metadata.url;
+    const visibleUrl = (visibleConversation.metadata && visibleConversation.metadata.url) || window.location.href;
+    if (!previousConversation || previousUrl !== visibleUrl) {
+      return normalizeConversationMessageOrder(visibleConversation);
+    }
+
+    const messages = [];
+    const indexById = new Map();
+    const indexByBackendId = new Map();
+    const indexByText = new Map();
+
+    function rememberMessageIndexes(message, index) {
+      if (message.id) {
+        indexById.set(message.id, index);
+      }
+
+      const backendMessageId = getMessageBackendId(message);
+      if (backendMessageId) {
+        indexByBackendId.set(`${message.role || ""}:${backendMessageId}`, index);
+      }
+
+      const textKey = getMessageTextMergeKey(message);
+      if (textKey && !indexByText.has(textKey)) {
+        indexByText.set(textKey, index);
+      }
+    }
+
+    function appendOrMergeMessage(message) {
+      const backendMessageId = getMessageBackendId(message);
+      const backendKey = backendMessageId ? `${message.role || ""}:${backendMessageId}` : "";
+      const textKey = getMessageTextMergeKey(message);
+      const existingIndex =
+        (message.id && indexById.has(message.id) ? indexById.get(message.id) : undefined) ??
+        (backendKey && indexByBackendId.has(backendKey) ? indexByBackendId.get(backendKey) : undefined) ??
+        (textKey && indexByText.has(textKey) ? indexByText.get(textKey) : undefined);
+
+      if (typeof existingIndex === "number") {
+        messages[existingIndex] = mergeConversationMessage(messages[existingIndex], message);
+        rememberMessageIndexes(messages[existingIndex], existingIndex);
+        return;
+      }
+
+      messages.push(message);
+      rememberMessageIndexes(message, messages.length - 1);
+    }
+
+    previousConversation.messages.forEach(appendOrMergeMessage);
+    visibleConversation.messages.forEach(appendOrMergeMessage);
+
+    return normalizeConversationMessageOrder({
+      ...visibleConversation,
+      messages,
+    });
+  }
+
+  function getCurrentConversationId() {
+    const match = window.location.pathname.match(/\/c\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+
+  function decodeBase64Utf8(value) {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index) & 0xff;
+    }
+    return new TextDecoder().decode(bytes);
+  }
+
+  function parsePageFetchJsonPayload(payload) {
+    if (!payload || payload.ok !== true) {
+      return null;
+    }
+
+    const rawText =
+      typeof payload.text === "string" && payload.text
+        ? payload.text
+        : typeof payload.base64 === "string" && payload.base64
+          ? decodeBase64Utf8(payload.base64)
+          : "";
+    if (!rawText) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(rawText);
+    } catch {
+      return null;
+    }
+  }
+
+  function getCapturedConversationApiPayload(conversationId) {
+    if (!conversationId) {
+      return null;
+    }
+
+    const pageBridge = window.ChatGPTExporterPageBridge;
+    const events = pageBridge && typeof pageBridge.getEvents === "function" ? pageBridge.getEvents() : [];
+    const encodedId = encodeURIComponent(conversationId).toLowerCase();
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index];
+      if (!event || event.ok !== true || typeof event.url !== "string") {
+        continue;
+      }
+
+      const lowerUrl = event.url.toLowerCase();
+      if (!lowerUrl.includes("/backend-api/conversation/" + encodedId)) {
+        continue;
+      }
+
+      const payload = parsePageFetchJsonPayload(event);
+      if (payload && payload.mapping) {
+        return payload;
+      }
+    }
+
+    return null;
+  }
+
+  async function requestConversationApiPayload(conversationId) {
+    if (!conversationId) {
+      return null;
+    }
+
+    const capturedPayload = getCapturedConversationApiPayload(conversationId);
+    if (capturedPayload) {
+      return capturedPayload;
+    }
+
+    const apiUrl = `${window.location.origin}/backend-api/conversation/${encodeURIComponent(conversationId)}`;
+    try {
+      const response = await fetch(apiUrl, {
+        credentials: "include",
+        headers: {
+          accept: "application/json",
+        },
+      });
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch {
+      // Fall through to the page-context bridge below.
+    }
+
+    injectPageHook();
+    await delay(180);
+    const pagePayload = await requestPageFetch(apiUrl).catch(() => null);
+    return parsePageFetchJsonPayload(pagePayload) || getCapturedConversationApiPayload(conversationId);
+  }
+
+  function getBackendNodeMessage(node) {
+    return node && typeof node === "object" && node.message && typeof node.message === "object"
+      ? node.message
+      : null;
+  }
+
+  function getBackendMessageRole(message) {
+    const role = message && message.author && typeof message.author.role === "string" ? message.author.role : "";
+    return role === "user" || role === "assistant" ? role : "";
+  }
+
+  function getBackendMessageText(message) {
+    const content = message && message.content && typeof message.content === "object" ? message.content : null;
+    if (!content) {
+      return "";
+    }
+
+    if (typeof content.text === "string") {
+      return normalizeWhitespace(content.text);
+    }
+
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    const text = parts
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+        if (!part || typeof part !== "object") {
+          return "";
+        }
+        if (typeof part.text === "string") {
+          return part.text;
+        }
+        if (typeof part.name === "string") {
+          return part.name;
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n");
+
+    return normalizeWhitespace(text);
+  }
+
+  function getBackendConversationNodes(payload) {
+    const mapping = payload && payload.mapping && typeof payload.mapping === "object" ? payload.mapping : null;
+    if (!mapping) {
+      return [];
+    }
+
+    const currentNodeId =
+      (typeof payload.current_node === "string" && payload.current_node) ||
+      (typeof payload.current_node_id === "string" && payload.current_node_id) ||
+      "";
+    if (currentNodeId && mapping[currentNodeId]) {
+      const path = [];
+      const seen = new Set();
+      let current = mapping[currentNodeId];
+      while (current && typeof current === "object" && !seen.has(current.id)) {
+        seen.add(current.id);
+        path.unshift(current);
+        const parentId = typeof current.parent === "string" ? current.parent : "";
+        current = parentId ? mapping[parentId] : null;
+      }
+      if (path.some((node) => getBackendMessageRole(getBackendNodeMessage(node)))) {
+        return path;
+      }
+    }
+
+    return Object.values(mapping).sort((left, right) => {
+      const leftMessage = getBackendNodeMessage(left);
+      const rightMessage = getBackendNodeMessage(right);
+      const leftTime = typeof leftMessage?.create_time === "number" ? leftMessage.create_time : 0;
+      const rightTime = typeof rightMessage?.create_time === "number" ? rightMessage.create_time : 0;
+      return leftTime - rightTime;
+    });
+  }
+
+  function collectBackendMessageAssets(message) {
+    const content = message && message.content && typeof message.content === "object" ? message.content : null;
+    const parts = content && Array.isArray(content.parts) ? content.parts : [];
+    return parts
+      .filter((part) => part && typeof part === "object" && typeof part.asset_pointer === "string")
+      .map((part, index) => ({
+        kind: "file",
+        url: "",
+        filename: normalizeWhitespace(part.name || part.asset_pointer || `attachment-${index + 1}`),
+        downloadStatus: "failed",
+        error: "该附件来自会话 API，但当前 DOM 中没有可直接下载的附件入口。",
+      }));
+  }
+
+  function conversationFromBackendPayload(payload) {
+    const nodes = getBackendConversationNodes(payload);
+    if (!nodes.length) {
+      return null;
+    }
+
+    const messages = [];
+    let turnIndex = 0;
+    let userMessageIndex = 0;
+    let assistantMessageIndex = 0;
+
+    nodes.forEach((node) => {
+      const backendMessage = getBackendNodeMessage(node);
+      const role = getBackendMessageRole(backendMessage);
+      if (!role || backendMessage?.metadata?.is_visually_hidden_from_conversation === true) {
+        return;
+      }
+
+      const text = getBackendMessageText(backendMessage);
+      const assets = collectBackendMessageAssets(backendMessage);
+      if (!text && !assets.length) {
+        return;
+      }
+
+      turnIndex += 1;
+      const turnId = `conversation-turn-${turnIndex}`;
+      const index = role === "user" ? (userMessageIndex += 1) : (assistantMessageIndex += 1);
+      messages.push({
+        id: backendMessage.id ? `${backendMessage.id}:${role}` : `${turnId}:${role}`,
+        backendMessageId: backendMessage.id || "",
+        backendNodeId: typeof node.id === "string" ? node.id : "",
+        turnNodeId: typeof node.id === "string" ? node.id : "",
+        turnId,
+        sequenceIndex: turnIndex,
+        sequenceSource: "backend",
+        index,
+        role,
+        text,
+        markdown: role === "assistant" ? text : text,
+        html: "",
+        assets,
+      });
+    });
+
+    if (!messages.length) {
+      return null;
+    }
+
+    return normalizeConversationMessageOrder({
+      metadata: {
+        title: payload.title || cleanConversationTitle(),
+        url: window.location.href,
+        exportedAt: new Date().toISOString(),
+        messageCount: messages.length,
+      },
+      messages,
+    });
+  }
+
+  async function fetchFullConversationFromBackend() {
+    const conversationId = getCurrentConversationId();
+    if (!conversationId) {
+      return null;
+    }
+
+    const payload = await requestConversationApiPayload(conversationId);
+    return conversationFromBackendPayload(payload);
+  }
+
+  async function loadConversationFromDomHistory(forceReload = false) {
+    const currentUrl = window.location.href;
+    if (!forceReload && domHistoryLoadedUrl === currentUrl) {
+      return latestConversation;
+    }
+
+    if (domHistoryLoadPromise && domHistoryLoadUrl === currentUrl) {
+      return domHistoryLoadPromise;
+    }
+
+    domHistoryLoadUrl = currentUrl;
+    domHistoryLoadPromise = (async () => {
+      try {
+        const scrollContainer = resolveFallbackScrollContainer();
+        if (!(scrollContainer instanceof HTMLElement)) {
+          return latestConversation;
+        }
+
+        const originalTop = scrollContainer.scrollTop;
+        const originalBottomGap = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight - originalTop);
+        let stableRounds = 0;
+        let lastTop = -1;
+        let lastSignature = "";
+
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          if (window.location.href !== currentUrl) {
+            return latestConversation;
+          }
+
+          latestConversation = mergeConversationFragments(latestConversation, collectConversation());
+          const signature = getConversationSignature(latestConversation);
+          const currentTop = scrollContainer.scrollTop;
+          if (signature === lastSignature && Math.abs(currentTop - lastTop) < 2) {
+            stableRounds += 1;
+          } else {
+            stableRounds = 0;
+          }
+
+          lastSignature = signature;
+          lastTop = currentTop;
+          if (currentTop <= 2 && stableRounds >= 2) {
+            break;
+          }
+
+          const step = Math.max(scrollContainer.clientHeight * 0.82, 420);
+          scrollContainer.scrollTo({
+            top: Math.max(0, currentTop - step),
+            behavior: "auto",
+          });
+          await delay(180);
+        }
+
+        latestConversation = mergeConversationFragments(latestConversation, collectConversation());
+        const restoreTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight - originalBottomGap);
+        scrollContainer.scrollTo({
+          top: restoreTop,
+          behavior: "auto",
+        });
+        await delay(120);
+        latestConversation = mergeConversationFragments(latestConversation, collectConversation());
+        domHistoryLoadedUrl = currentUrl;
+        lastTimelineSignature = "";
+        renderTimelineList();
+        ensureTimelineTracking();
+        refreshActiveTimelineMessage();
+        return latestConversation;
+      } finally {
+        if (domHistoryLoadUrl === currentUrl) {
+          domHistoryLoadPromise = null;
+          domHistoryLoadUrl = "";
+        }
+      }
+    })();
+
+    return domHistoryLoadPromise;
+  }
+
+  async function loadFullConversationFromBackend(forceReload = false) {
+    const currentUrl = window.location.href;
+    if (!forceReload && fullConversationLoadedUrl === currentUrl) {
+      return latestConversation;
+    }
+
+    if (fullConversationLoadPromise && fullConversationLoadUrl === currentUrl) {
+      return fullConversationLoadPromise;
+    }
+
+    fullConversationLoadUrl = currentUrl;
+    fullConversationLoadPromise = (async () => {
+      try {
+        const backendConversation = await fetchFullConversationFromBackend();
+        if (window.location.href !== currentUrl) {
+          return latestConversation;
+        }
+        if (backendConversation && backendConversation.messages.length) {
+          latestConversation = mergeConversationFragments(latestConversation, backendConversation);
+          latestConversation = mergeConversationFragments(latestConversation, collectConversation());
+          fullConversationLoadedUrl = currentUrl;
+          lastTimelineSignature = "";
+          renderTimelineList();
+          if (selectionLoaded) {
+            selectedMessageIds = new Set(
+              latestConversation.messages
+                .map((message) => message.id)
+                .filter((messageId) => selectedMessageIds.has(messageId)),
+            );
+            renderSelectionList(latestConversation);
+            lastSelectionSignature = getConversationSignature(latestConversation);
+          }
+          ensureTimelineTracking();
+          refreshActiveTimelineMessage();
+          return latestConversation;
+        }
+
+        return latestConversation;
+      } finally {
+        if (fullConversationLoadUrl === currentUrl) {
+          fullConversationLoadPromise = null;
+          fullConversationLoadUrl = "";
+        }
+      }
+    })();
+
+    return fullConversationLoadPromise;
+  }
+
+  async function collectConversationSnapshot(forceBackend = false) {
+    if (forceBackend) {
+      await loadFullConversationFromBackend(true).catch(() => null);
+    }
+
+    return mergeConversationFragments(latestConversation, collectConversation());
   }
 
   function getMessageDisplayName(message) {
@@ -479,14 +1116,26 @@
 
     scrollContainer.scrollTo({
       top: Math.max(0, nextTop),
-      behavior: "smooth",
+      behavior: "auto",
     });
   }
 
-  function resolveTimelineTurn(message) {
-    if (!message || typeof message.turnId !== "string") {
-      return null;
+  function textLooksLikeSameMessage(candidateText, expectedText) {
+    const candidate = normalizeWhitespace(candidateText || "");
+    const expected = normalizeWhitespace(expectedText || "");
+    if (!expected) {
+      return true;
     }
+    if (!candidate) {
+      return false;
+    }
+    if (candidate === expected) {
+      return true;
+    }
+
+    const sample = expected.slice(0, Math.min(160, expected.length));
+    return sample.length >= 16 && candidate.includes(sample);
+  }
 
     if (message.platform === "gemini") {
       const hinted = querySelectorSafe(message.hostSelectorHint || "");
@@ -502,16 +1151,194 @@
         ? `[${GEMINI_TURN_ID_ATTR}="${turnId}"]`
         : `section[data-testid="${turnId}"]`;
     const turn = querySelectorSafe(selector);
+  function getTurnBodyForRole(turn, role) {
     if (!(turn instanceof HTMLElement)) {
       return null;
     }
 
-    return turn;
+    if (role === "user") {
+      return resolveUserBody(turn);
+    }
+
+    const assistantNode = resolveAssistantMessageNode(turn);
+    if (!(assistantNode instanceof HTMLElement)) {
+      return null;
+    }
+
+    return assistantNode.querySelector(ASSISTANT_BODY_SELECTOR) || assistantNode;
+  }
+
+  function elementHasAnyMessageDomId(element, ids) {
+    if (!(element instanceof Element) || !Array.isArray(ids) || !ids.length) {
+      return false;
+    }
+
+    return ids.some(
+      (id) =>
+        element.getAttribute("data-message-id") === id ||
+        element.getAttribute("data-turn-id") === id ||
+        element.getAttribute("data-turn-id-container") === id,
+    );
+  }
+
+  function turnContainsAnyMessageDomId(turn, ids) {
+    if (!(turn instanceof HTMLElement) || !Array.isArray(ids) || !ids.length) {
+      return false;
+    }
+
+    const nodes = [
+      turn,
+      ...Array.from(turn.querySelectorAll("[data-message-id], [data-turn-id], [data-turn-id-container]")),
+    ];
+    return nodes.some((node) => elementHasAnyMessageDomId(node, ids));
+  }
+
+  function turnLooksLikeMessage(turn, message) {
+    if (!(turn instanceof HTMLElement) || !message) {
+      return false;
+    }
+
+    const domIds = getMessageDomTurnIds(message);
+    if (turnContainsAnyMessageDomId(turn, domIds)) {
+      return true;
+    }
+
+    const body = getTurnBodyForRole(turn, message.role);
+    if (!(body instanceof HTMLElement)) {
+      return false;
+    }
+
+    return textLooksLikeSameMessage(body.innerText, getMessageLookupText(message));
+  }
+
+  function resolveTurnFromBackendNode(node) {
+    if (!(node instanceof HTMLElement)) {
+      return null;
+    }
+
+    if (node.matches(TURN_SELECTOR)) {
+      return node;
+    }
+
+    const closestTurn = node.closest(TURN_SELECTOR);
+    if (closestTurn instanceof HTMLElement) {
+      return closestTurn;
+    }
+
+    const nestedTurn = node.querySelector(TURN_SELECTOR);
+    return nestedTurn instanceof HTMLElement ? nestedTurn : null;
+  }
+
+  function resolveTurnByMessageDomId(message) {
+    const domIds = getMessageDomTurnIds(message);
+    if (!domIds.length) {
+      return null;
+    }
+
+    const directTurn = resolveTurns().find(
+      (turn) => turn instanceof HTMLElement && turnContainsAnyMessageDomId(turn, domIds),
+    );
+    if (directTurn instanceof HTMLElement) {
+      return directTurn;
+    }
+
+    const node = Array.from(
+      document.querySelectorAll("[data-message-id], [data-turn-id], [data-turn-id-container]"),
+    ).find((candidate) => elementHasAnyMessageDomId(candidate, domIds));
+    return resolveTurnFromBackendNode(node);
+  }
+
+  function resolveTurnByText(message) {
+    const expectedText = getMessageLookupText(message);
+    if (!expectedText) {
+      return null;
+    }
+
+    return (
+      resolveTurns().find((turn) => turn instanceof HTMLElement && turnLooksLikeMessage(turn, message)) || null
+    );
+  }
+
+  function resolveTimelineTurn(message) {
+    if (!message) {
+      return null;
+    }
+
+    const backendTurn = resolveTurnByMessageDomId(message);
+    if (backendTurn instanceof HTMLElement) {
+      return backendTurn;
+    }
+
+    if (typeof message.turnId === "string" && message.turnId) {
+      const turn = document.querySelector(`section[data-testid="${message.turnId}"]`);
+      if (turn instanceof HTMLElement) {
+        return turn;
+      }
+    }
+
+    const textTurn = resolveTurnByText(message);
+    return textTurn instanceof HTMLElement ? textTurn : null;
+  }
+
+  function resolveLatestTimelineMessage(message) {
+    if (!message || !latestConversation || !Array.isArray(latestConversation.messages)) {
+      return message;
+    }
+
+    const backendMessageId = getMessageBackendId(message);
+    const textKey = getMessageTextMergeKey(message);
+    return (
+      latestConversation.messages.find((candidate) => candidate.id === message.id) ||
+      (backendMessageId
+        ? latestConversation.messages.find(
+            (candidate) => candidate.role === message.role && getMessageBackendId(candidate) === backendMessageId,
+          )
+        : null) ||
+      (textKey ? latestConversation.messages.find((candidate) => getMessageTextMergeKey(candidate) === textKey) : null) ||
+      message
+    );
   }
 
   function resolveTimelineTargetElement(message) {
-    const turn = resolveTimelineTurn(message);
-    if (!(turn instanceof HTMLElement)) {
+    const latestMessage = resolveLatestTimelineMessage(message);
+    const turn = resolveTimelineTurn(latestMessage);
+    return turn instanceof HTMLElement ? turn : null;
+  }
+
+  function getTimelineMessageRatio(message) {
+    const messages = getTimelineMessages();
+    if (!messages.length) {
+      return 0;
+    }
+
+    const backendMessageId = getMessageBackendId(message);
+    const textKey = getMessageTextMergeKey(message);
+    const index = messages.findIndex(
+      (candidate) =>
+        candidate.id === message.id ||
+        (backendMessageId && getMessageBackendId(candidate) === backendMessageId) ||
+        (textKey && getMessageTextMergeKey(candidate) === textKey),
+    );
+    if (index < 0) {
+      return 0;
+    }
+
+    return messages.length === 1 ? 0 : index / (messages.length - 1);
+  }
+
+  function resolveFallbackScrollContainer() {
+    const scrollContainer = resolveScrollContainer();
+    if (scrollContainer instanceof HTMLElement) {
+      return scrollContainer;
+    }
+
+    const scrollingElement = document.scrollingElement;
+    return scrollingElement instanceof HTMLElement ? scrollingElement : null;
+  }
+
+  async function loadTimelineMessageIntoDom(message) {
+    const scrollContainer = resolveFallbackScrollContainer();
+    if (!(scrollContainer instanceof HTMLElement)) {
       return null;
     }
 
@@ -522,6 +1349,28 @@
 
     const userBody = resolveUserBody(turn);
     return userBody instanceof HTMLElement ? userBody : turn;
+    const baseRatio = getTimelineMessageRatio(message);
+    const offsets = [0, -0.08, 0.08, -0.16, 0.16, -0.28, 0.28];
+    for (let attempt = 0; attempt < offsets.length; attempt += 1) {
+      const ratio = Math.max(0, Math.min(1, baseRatio + offsets[attempt]));
+      const maxTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+      scrollContainer.scrollTo({
+        top: Math.round(maxTop * ratio),
+        behavior: attempt === 0 ? "smooth" : "auto",
+      });
+
+      await delay(attempt === 0 ? 480 : 320);
+      syncLiveConversation();
+
+      const latestMessage = resolveLatestTimelineMessage(message);
+      const target = resolveTimelineTargetElement(latestMessage);
+      const turn = resolveTimelineTurn(latestMessage);
+      if (target instanceof HTMLElement && turn instanceof HTMLElement) {
+        return { message: latestMessage, target, turn };
+      }
+    }
+
+    return null;
   }
 
   function resolveTimelineTopOffset(scrollContainer, target) {
@@ -585,11 +1434,25 @@
     });
   }
 
-  function scrollToMessage(message) {
-    const target = resolveTimelineTargetElement(message);
-    const turn = resolveTimelineTurn(message);
+  async function scrollToMessage(message) {
+    let effectiveMessage = resolveLatestTimelineMessage(message);
+    activeTimelineMessageId = message.id;
+    timelineLockedMessageId = message.id;
+    timelineLockedUntil = Date.now() + TIMELINE_ACTIVE_LOCK_MS;
+    updateTimelineActiveStyles();
+
+    let target = resolveTimelineTargetElement(effectiveMessage);
+    let turn = resolveTimelineTurn(effectiveMessage);
     if (!(target instanceof HTMLElement) || !(turn instanceof HTMLElement)) {
-      return;
+      const materialized = await loadTimelineMessageIntoDom(effectiveMessage);
+      if (!materialized) {
+        requestTimelineRefresh();
+        return;
+      }
+
+      effectiveMessage = materialized.message;
+      target = materialized.target;
+      turn = materialized.turn;
     }
 
     const scrollContainer = resolveScrollContainer();
@@ -603,7 +1466,7 @@
     } else {
       target.scrollIntoView({
         block: "start",
-        behavior: "smooth",
+        behavior: "auto",
       });
     }
 
@@ -619,6 +1482,8 @@
 
     activeTimelineMessageId = message.id;
     timelineLockedMessageId = message.id;
+    activeTimelineMessageId = effectiveMessage.id || message.id;
+    timelineLockedMessageId = activeTimelineMessageId;
     timelineLockedUntil = Date.now() + TIMELINE_ACTIVE_LOCK_MS;
     updateTimelineActiveStyles();
 
@@ -1013,7 +1878,7 @@
       setStatus("正在读取当前会话消息列表…", "muted");
 
       if (forceReload || !latestConversation) {
-        latestConversation = collectConversation();
+        latestConversation = await collectConversationSnapshot(true);
       }
 
       if (!latestConversation || !latestConversation.messages.length) {
@@ -1045,11 +1910,32 @@
 
   function syncLiveConversation() {
     const turns = resolveTurns();
+    const currentUrl = window.location.href;
+    const routeChanged = currentUrl !== lastConversationUrl;
+
+    if (routeChanged) {
+      lastConversationUrl = currentUrl;
+      lastSelectionSignature = "";
+      lastTimelineSignature = "";
+      selectedMessageIds = new Set();
+      selectionLoaded = false;
+      activeTimelineMessageId = "";
+      timelineLockedMessageId = "";
+      timelineLockedUntil = 0;
+      latestConversation = null;
+      fullConversationLoadedUrl = "";
+      domHistoryLoadedUrl = "";
+      scheduleTimelineSettledRefreshes();
+      void loadFullConversationFromBackend(true);
+    }
+
     if (!turns.length) {
+      lastTimelineSignature = "";
+      renderTimelineList();
       return;
     }
 
-    const nextConversation = collectConversation();
+    const nextConversation = mergeConversationFragments(latestConversation, collectConversation());
     const nextSignature = getConversationSignature(nextConversation);
     const selectionChanged = nextSignature !== lastSelectionSignature;
     const timelineChanged = nextSignature !== lastTimelineSignature;
@@ -1084,7 +1970,19 @@
     timelineRefreshTimer = window.setTimeout(() => {
       timelineRefreshTimer = 0;
       syncLiveConversation();
-    }, 180);
+    }, 260);
+  }
+
+  function scheduleTimelineSettledRefreshes() {
+    timelineSettledRefreshTimers.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    timelineSettledRefreshTimers = [600, 1400, 2800].map((delayMs) =>
+      window.setTimeout(() => {
+        requestTimelineRefresh();
+        void loadFullConversationFromBackend(false);
+      }, delayMs),
+    );
   }
 
   async function prepareTimeline(forceReload) {
@@ -1095,7 +1993,7 @@
     timelineInFlight = true;
     try {
       if (forceReload || !latestConversation) {
-        latestConversation = collectConversation();
+        latestConversation = await collectConversationSnapshot(true);
       }
 
       if (!latestConversation || !latestConversation.messages.length) {
@@ -1168,7 +2066,7 @@
     backdrop.hidden = !backdrop.hidden;
     backdrop.style.display = backdrop.hidden ? "none" : "flex";
 
-    if (!backdrop.hidden && !latestConversation) {
+    if (!backdrop.hidden) {
       void prepareSelection(true);
     }
   }
@@ -1450,14 +2348,18 @@
     injectTimer = window.setTimeout(() => {
       injectTimer = 0;
       ensureToolbar();
-      requestTimelineRefresh();
+      if (TIMELINE_ENABLED) {
+        requestTimelineRefresh();
+      }
     }, 120);
   }
 
   function installObservers() {
     const observer = new MutationObserver(() => {
       scheduleToolbarInjection();
-      requestTimelineRefresh();
+      if (TIMELINE_ENABLED) {
+        requestTimelineRefresh();
+      }
       scheduleFormulaCopyEnhancement();
     });
 
@@ -1475,7 +2377,9 @@
     window.addEventListener(
       "resize",
       () => {
-        requestTimelineRefresh();
+        if (TIMELINE_ENABLED) {
+          requestTimelineRefresh();
+        }
       },
       { passive: true },
     );
@@ -1515,6 +2419,29 @@
 
   function resolveUserBody(turn) {
     return turn.querySelector(USER_BODY_SELECTOR) || turn.querySelector(USER_ROLE_SELECTOR);
+  }
+
+  function resolveDomBackendMessageId(...roots) {
+    for (const root of roots) {
+      if (!(root instanceof Element)) {
+        continue;
+      }
+
+      const direct = root.getAttribute("data-message-id");
+      if (direct) {
+        return direct;
+      }
+
+      const nested = root.querySelector("[data-message-id]");
+      if (nested instanceof Element) {
+        const messageId = nested.getAttribute("data-message-id");
+        if (messageId) {
+          return messageId;
+        }
+      }
+    }
+
+    return "";
   }
 
   function resolveAssistantMessageNode(turn) {
@@ -2946,12 +3873,16 @@
         const text = normalizeWhitespace(userBody.innerText);
         const assets = extractMessageAssets(turn, userBody);
         if (text || assets.length) {
+          const backendMessageId = resolveDomBackendMessageId(userBody, turn);
           userMessageIndex += 1;
           messages.push({
-            id: `${turnId}:user`,
+            id: backendMessageId ? `${backendMessageId}:user` : `${turnId}:user`,
+            backendMessageId,
             turnId,
             platform: "chatgpt",
             assistantLabel: "gpt",
+            sequenceIndex: getMessageTurnOrder({ turnId }, index),
+            sequenceSource: "dom",
             index: userMessageIndex,
             role: "user",
             text,
@@ -2980,12 +3911,16 @@
         return;
       }
 
+      const backendMessageId = resolveDomBackendMessageId(assistantNode, assistantBody, turn);
       assistantMessageIndex += 1;
       messages.push({
-        id: `${turnId}:assistant`,
+        id: backendMessageId ? `${backendMessageId}:assistant` : `${turnId}:assistant`,
+        backendMessageId,
         turnId,
         platform: "chatgpt",
         assistantLabel: "gpt",
+        sequenceIndex: getMessageTurnOrder({ turnId }, index),
+        sequenceSource: "dom",
         index: assistantMessageIndex,
         role: "assistant",
         text,
@@ -3898,7 +4833,7 @@
     );
 
     try {
-      latestConversation = collectConversation();
+      latestConversation = await collectConversationSnapshot(true);
       const conversation = applySelection(latestConversation);
 
       if (!conversation.messages.length) {
@@ -3906,7 +4841,9 @@
       }
 
       renderSelectionList(latestConversation);
-      renderTimelineList();
+      if (TIMELINE_ENABLED) {
+        renderTimelineList();
+      }
 
       if (format === "pdf") {
         const filename = `${cleanConversationTitle()}.pdf`;
@@ -3963,10 +4900,16 @@
     ensureTimelinePanel();
     installFormulaCopyHandler();
     installObservers();
-    void prepareTimeline(true);
-    requestTimelineRefresh();
+    if (TIMELINE_ENABLED) {
+      void prepareTimeline(true);
+      requestTimelineRefresh();
+      void loadFullConversationFromBackend(true);
+    }
     scheduleFormulaCopyEnhancement();
   }
+
+  installPageHookBridge();
+  injectPageHook();
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", start, { once: true });
