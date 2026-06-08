@@ -2,8 +2,8 @@
 
 # GPT Dialogue Extractor
 
-A browser extension for exporting the current ChatGPT conversation.  
-It reads the rendered conversation directly from `chatgpt.com` and exports it to local files.
+A browser extension for exporting the current ChatGPT / Gemini conversation.
+It reads the rendered conversation directly from the web page and exports it to local files.
 
 <p>
   <a href="./README.md">
@@ -22,10 +22,11 @@ It reads the rendered conversation directly from `chatgpt.com` and exports it to
 - Export the current conversation as `JSON`
 - Export the current conversation as `Markdown`
 - Export the current conversation as `PDF`
+- Export the current conversation and attachments as `ZIP`
 - Choose a custom save location
 - Select which messages to export
-- Load older history before export
-- Restore the reading position after export preparation
+- Extract ChatGPT web conversations
+- Extract Gemini web conversations
 - Export code blocks
 - Export common formulas
 - Right-side user-message timeline with hover preview and jump navigation
@@ -52,10 +53,12 @@ It reads the rendered conversation directly from `chatgpt.com` and exports it to
 
 ### 1. Open a conversation page
 
-Open any ChatGPT conversation page:
+Open any supported conversation page:
 
 - `https://chatgpt.com/*`
 - `https://chat.openai.com/*`
+- `https://gemini.google.com/*`
+- `https://bard.google.com/*`
 
 The extension injects itself automatically.
 
@@ -81,11 +84,12 @@ If no message is selected, export will fail.
 
 ### 4. Choose an export format
 
-The panel provides three formats:
+The panel provides four formats:
 
 - `导出 JSON`
 - `导出 Markdown`
 - `导出 PDF`
+- `导出 ZIP`
 
 #### JSON
 
@@ -101,6 +105,10 @@ Best for saving and sharing.
 
 The current PDF export does not use the browser print dialog. The extension generates the PDF directly and downloads it, which makes it less likely to be affected by print-blocking extensions.
 
+#### ZIP
+
+Best for saving the structured conversation, Markdown, and any readable images or attachments together.
+
 ### 5. Save the file
 
 After clicking export, the browser opens a save dialog.
@@ -111,11 +119,11 @@ You can:
 - rename the file
 - confirm the download
 
-### 6. History loading behavior
+### 6. Current Read Scope
 
-If older messages have not been fully loaded in the page yet, the extension will load them before export.
+The extension reads messages that are already rendered in the current page DOM.
 
-After that, it tries to restore your previous reading position instead of leaving the page at the top.
+If the web app has not rendered older messages into the current DOM, those messages will not be exported.
 
 ### 7. Use the timeline
 

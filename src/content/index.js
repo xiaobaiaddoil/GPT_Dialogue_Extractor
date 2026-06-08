@@ -12,21 +12,63 @@
     const ASSISTANT_ROLE_SELECTOR = '[data-message-author-role="assistant"]';
     const ASSISTANT_PRIMARY_SELECTOR = '[data-message-author-role="assistant"][data-turn-start-message="true"]';
     const ASSISTANT_BODY_SELECTOR = ".markdown";
-    const CODE_CONTENT_SELECTOR = ".cm-content";
+    const CODE_CONTENT_SELECTOR = [
+        ".cm-content",
+        'code[data-test-id="code-content"]',
+        "code.code-container",
+    ].join(", ");
+    const GEMINI_HOSTNAMES = ["gemini.google.com", "bard.google.com"];
+    const GEMINI_TURN_ID_ATTR = "data-cge-gemini-turn-id";
+    const GEMINI_USER_HOST_SELECTOR = [
+        "user-query",
+        "[data-testid*='user-query' i]",
+        "[data-test-id*='user-query' i]",
+    ].join(", ");
+    const GEMINI_ASSISTANT_HOST_SELECTOR = [
+        "model-response",
+        "[data-testid*='model-response' i]",
+        "[data-test-id*='model-response' i]",
+        "[class*='model-response' i]",
+    ].join(", ");
+    const GEMINI_ASSISTANT_FALLBACK_HOST_SELECTOR = [
+        "response-container",
+        "message-content",
+        "[class*='response-container' i]",
+        "[class*='response-content' i]",
+        "[class*='model-response-text' i]",
+    ].join(", ");
+    const GEMINI_USER_BODY_SELECTOR = [
+        ".query-text",
+        "[class*='query-text' i]",
+        "[data-testid*='query-text' i]",
+        "[data-test-id*='query-text' i]",
+        "[contenteditable='true']",
+    ].join(", ");
+    const GEMINI_ASSISTANT_BODY_SELECTOR = [
+        "message-content",
+        ".markdown",
+        "[class*='markdown' i]",
+        "[class*='model-response-text' i]",
+        "[class*='response-content' i]",
+    ].join(", ");
     const MATH_ROOT_SELECTOR = [
         ".katex-display",
         ".math-display",
+        ".math-inline",
         ".katex",
         "math",
         "mjx-container",
+        "[data-math]",
         "[data-latex]",
         "[data-tex]",
         'script[type^="math/tex"]',
     ].join(", ");
     const INLINE_MATH_ROOT_SELECTOR = [
+        ".math-inline",
         ".katex",
         "math",
         "mjx-container",
+        "[data-math]",
         "[data-latex]",
         "[data-tex]",
         'script[type^="math/tex"]',
@@ -34,7 +76,9 @@
     const BLOCK_MATH_ROOT_SELECTOR = [
         ".katex-display",
         ".math-display",
+        ".math-block",
         'mjx-container[display="true"]',
+        '[data-math-display="true"]',
         '[data-tex-display="true"]',
         '[data-latex-display="true"]',
     ].join(", ");
@@ -79,12 +123,19 @@
     let timelineLockedMessageId = "";
     let timelineLockedUntil = 0;
     let timelineDirectoryExpanded = false;
+    let geminiTurnSequence = 0;
     const documentAssetHintCache = new Map();
     const primedNativeAssetKeys = new Set();
     function delay(ms) {
         return new Promise((resolve) => {
             window.setTimeout(resolve, ms);
         });
+    }
+    function isGeminiPage() {
+        return GEMINI_HOSTNAMES.includes(window.location.hostname);
+    }
+    function getAssistantLabelForPlatform(platform) {
+        return platform === "gemini" ? "gemini" : "gpt";
     }
     function normalizeWhitespace(value) {
         return value.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n").trim();
@@ -99,6 +150,29 @@
     function escapeRegExp(value) {
         return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     }
+    function escapeCssAttributeValue(value) {
+        return String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    }
+    function buildIdSelector(id) {
+        if (!id) {
+            return "";
+        }
+        if (window.CSS && typeof window.CSS.escape === "function") {
+            return `#${window.CSS.escape(id)}`;
+        }
+        return `[id="${escapeCssAttributeValue(id)}"]`;
+    }
+    function querySelectorSafe(selector) {
+        if (!selector) {
+            return null;
+        }
+        try {
+            return document.querySelector(selector);
+        }
+        catch {
+            return null;
+        }
+    }
     function buildAssetTrackingKey(message, asset) {
         const turnPart = normalizeWhitespace((message && (message.turnId || message.id)) || "");
         const namePart = normalizeWhitespace((asset && (asset.filename || asset.url)) || "");
@@ -111,13 +185,15 @@
         return conversation.messages.map((message) => message.id).join("|");
     }
     function getMessageDisplayName(message) {
-        return `${message.role === "user" ? "user" : "gpt"}${message.index}`;
+        return `${message.role === "user" ? "user" : message.assistantLabel || getAssistantLabelForPlatform(message.platform)}${message.index}`;
     }
     function cleanConversationTitle() {
         const rawTitle = document.title || "chatgpt-conversation";
         return sanitizeFileName(rawTitle
             .replace(/\s*-\s*ChatGPT\s*$/i, "")
+            .replace(/\s*-\s*Gemini\s*$/i, "")
             .replace(/\s*\|\s*ChatGPT\s*$/i, "")
+            .replace(/\s*\|\s*Gemini\s*$/i, "")
             .trim());
     }
     function installPageHookBridge() {
@@ -338,7 +414,18 @@
         if (!message || typeof message.turnId !== "string") {
             return null;
         }
-        const turn = document.querySelector(`section[data-testid="${message.turnId}"]`);
+        if (message.platform === "gemini") {
+            const hinted = querySelectorSafe(message.hostSelectorHint || "");
+            if (hinted instanceof HTMLElement) {
+                const hintedTurn = hinted.closest("user-query, model-response") || hinted;
+                return hintedTurn instanceof HTMLElement ? hintedTurn : null;
+            }
+        }
+        const turnId = escapeCssAttributeValue(message.turnId);
+        const selector = message.platform === "gemini"
+            ? `[${GEMINI_TURN_ID_ATTR}="${turnId}"]`
+            : `section[data-testid="${turnId}"]`;
+        const turn = querySelectorSafe(selector);
         if (!(turn instanceof HTMLElement)) {
             return null;
         }
@@ -348,6 +435,10 @@
         const turn = resolveTimelineTurn(message);
         if (!(turn instanceof HTMLElement)) {
             return null;
+        }
+        if (message.platform === "gemini") {
+            const body = resolveGeminiMessageBody(turn, message.role);
+            return body instanceof HTMLElement ? body : turn;
         }
         const userBody = resolveUserBody(turn);
         return userBody instanceof HTMLElement ? userBody : turn;
@@ -413,6 +504,15 @@
                 block: "start",
                 behavior: "smooth",
             });
+        }
+        if (message.platform === "gemini") {
+            window.setTimeout(() => {
+                target.scrollIntoView({
+                    block: "center",
+                    inline: "nearest",
+                    behavior: "smooth",
+                });
+            }, 80);
         }
         activeTimelineMessageId = message.id;
         timelineLockedMessageId = message.id;
@@ -839,7 +939,8 @@
     }
     function ensureToolbar() {
         const headerActions = document.querySelector(HEADER_ACTIONS_SELECTOR);
-        if (!headerActions) {
+        const shouldUseFloatingToolbar = !headerActions && isGeminiPage();
+        if (!headerActions && !shouldUseFloatingToolbar) {
             return;
         }
         if (document.getElementById(WRAPPER_ID)) {
@@ -851,13 +952,29 @@
         wrapper.style.display = "flex";
         wrapper.style.alignItems = "center";
         wrapper.style.gap = "8px";
+        if (shouldUseFloatingToolbar) {
+            wrapper.style.position = "fixed";
+            wrapper.style.top = "72px";
+            wrapper.style.right = "18px";
+            wrapper.style.zIndex = "2147483646";
+            wrapper.style.padding = "8px";
+            wrapper.style.borderRadius = "16px";
+            wrapper.style.background = "rgba(255, 255, 255, 0.92)";
+            wrapper.style.boxShadow = "0 10px 36px rgba(15, 23, 42, 0.18)";
+            wrapper.style.backdropFilter = "blur(10px)";
+        }
         const exportButton = createToolbarButton("导出", EXPORT_BUTTON_ID);
         exportButton.addEventListener("click", (event) => {
             event.stopPropagation();
             togglePanel();
         });
         wrapper.append(exportButton);
-        headerActions.prepend(wrapper);
+        if (headerActions) {
+            headerActions.prepend(wrapper);
+        }
+        else {
+            document.documentElement.append(wrapper);
+        }
         ensurePanel();
         ensureTimelinePanel();
     }
@@ -1129,6 +1246,9 @@
         }, { passive: true });
     }
     function resolveTurns() {
+        if (isGeminiPage()) {
+            return resolveGeminiMessageHosts().map((item) => item.host);
+        }
         return Array.from(document.querySelectorAll(TURN_SELECTOR));
     }
     function isScrollable(element) {
@@ -1163,6 +1283,15 @@
         return nodes[nodes.length - 1] || null;
     }
     function resolveCodeLanguage(codeNode) {
+        const geminiCodeBlock = codeNode.closest("code-block");
+        if (geminiCodeBlock instanceof HTMLElement) {
+            const header = geminiCodeBlock.querySelector(".code-block-decoration");
+            const candidates = Array.from((header || geminiCodeBlock).querySelectorAll("span, div"))
+                .map((element) => normalizeWhitespace(element.textContent || ""))
+                .filter((text) => text && text.length <= 32 && !/copy|download/i.test(text));
+            const language = candidates.find((text) => /^[a-z0-9+#.\- ]+$/i.test(text));
+            return normalizeCodeLanguage(language || "");
+        }
         let current = codeNode.parentElement;
         while (current && current !== document.body) {
             const hasCode = current.querySelector(CODE_CONTENT_SELECTOR);
@@ -1227,7 +1356,7 @@
         if (annotation) {
             return normalizeWhitespace(annotation.textContent || "");
         }
-        const dataLatex = node.getAttribute("data-latex") || node.getAttribute("data-tex");
+        const dataLatex = node.getAttribute("data-math") || node.getAttribute("data-latex") || node.getAttribute("data-tex");
         if (dataLatex) {
             return normalizeWhitespace(dataLatex);
         }
@@ -1385,6 +1514,41 @@
         const separator = Array.from({ length: firstRowColumns }, () => "---").join(" | ");
         return [`| ${serializedRows[0]} |`, `| ${separator} |`, ...serializedRows.slice(1).map((row) => `| ${row} |`)].join("\n");
     }
+    function readBlockCodeText(codeNode) {
+        if (!(codeNode instanceof HTMLElement)) {
+            return "";
+        }
+        if (codeNode.matches(CODE_CONTENT_SELECTOR)) {
+            return readCodeMirrorText(codeNode);
+        }
+        const nestedCode = codeNode.querySelector(CODE_CONTENT_SELECTOR) || codeNode.querySelector("pre code, code");
+        if (nestedCode instanceof HTMLElement) {
+            return readCodeMirrorText(nestedCode);
+        }
+        return (codeNode.innerText || codeNode.textContent || "").replace(/\u00a0/g, " ").replace(/\n+$/g, "");
+    }
+    function serializeCodeBlock(node) {
+        const codeNode = node.matches(CODE_CONTENT_SELECTOR) || node.tagName === "PRE"
+            ? node
+            : node.querySelector(CODE_CONTENT_SELECTOR) || node.querySelector("pre code, code, pre");
+        const code = readBlockCodeText(codeNode instanceof HTMLElement ? codeNode : node);
+        const language = resolveCodeLanguage(codeNode instanceof HTMLElement ? codeNode : node);
+        return `\`\`\`${language}\n${code}\n\`\`\``;
+    }
+    function serializeChildNodesAsBlocks(node) {
+        return Array.from(node.childNodes)
+            .map((child) => {
+            if (child.nodeType === Node.TEXT_NODE) {
+                return normalizeWhitespace(child.textContent || "");
+            }
+            if (!(child instanceof HTMLElement)) {
+                return "";
+            }
+            return serializeBlock(child);
+        })
+            .filter(Boolean)
+            .join("\n\n");
+    }
     function serializeBlock(node) {
         if (!(node instanceof HTMLElement)) {
             return "";
@@ -1395,17 +1559,14 @@
         if (isMathInlineNode(node)) {
             return serializeMathNode(node, false);
         }
-        if (node.matches(CODE_CONTENT_SELECTOR)) {
-            const code = readCodeMirrorText(node);
-            const language = resolveCodeLanguage(node);
-            return `\`\`\`${language}\n${code}\n\`\`\``;
-        }
-        const nestedCode = node.querySelector(CODE_CONTENT_SELECTOR);
-        if (nestedCode) {
-            return serializeBlock(nestedCode);
-        }
         const tagName = node.tagName;
+        if (tagName === "CODE-BLOCK" || node.matches(CODE_CONTENT_SELECTOR)) {
+            return serializeCodeBlock(node);
+        }
         if (tagName === "P") {
+            if (node.querySelector("code-block, pre, code[data-test-id='code-content'], code.code-container")) {
+                return serializeChildNodesAsBlocks(node);
+            }
             return normalizeWhitespace(Array.from(node.childNodes).map(serializeInline).join(""));
         }
         if (tagName === "UL") {
@@ -1428,14 +1589,14 @@
             return serializeTable(node);
         }
         if (tagName === "PRE") {
-            return `\`\`\`\n${node.innerText.replace(/\n+$/g, "")}\n\`\`\``;
+            return serializeCodeBlock(node);
         }
         if (tagName === "HR") {
             return "---";
         }
-        const childBlocks = Array.from(node.children).map(serializeBlock).filter(Boolean);
-        if (childBlocks.length) {
-            return childBlocks.join("\n\n");
+        const childBlocks = serializeChildNodesAsBlocks(node);
+        if (childBlocks) {
+            return childBlocks;
         }
         return normalizeWhitespace(node.innerText);
     }
@@ -1455,6 +1616,35 @@
         })
             .filter(Boolean);
         return normalizeWhitespace(blocks.join("\n\n"));
+    }
+    function readExportText(node) {
+        if (!(node instanceof HTMLElement)) {
+            return "";
+        }
+        const clone = node.cloneNode(true);
+        if (!(clone instanceof HTMLElement)) {
+            return normalizeWhitespace(node.innerText || node.textContent || "");
+        }
+        clone
+            .querySelectorAll([
+            "script",
+            "style",
+            ".cdk-visually-hidden",
+            "[aria-hidden='true']",
+            "[hidden]",
+            "message-actions",
+            "copy-button",
+            "thumb-up-button",
+            "thumb-down-button",
+            "sources-list",
+            "source-footnote",
+            "sources-carousel",
+            "sources-carousel-inline",
+        ].join(", "))
+            .forEach((noise) => {
+            noise.remove();
+        });
+        return normalizeWhitespace(clone.innerText || clone.textContent || "");
     }
     function normalizeAssetUrl(rawUrl) {
         if (typeof rawUrl !== "string") {
@@ -1802,11 +1992,18 @@
             return [];
         }
         const selectors = [
+            "file-card",
+            "user-query-file-preview",
             '[data-testid*="file"]',
+            '[data-test-id*="file"]',
             '[data-testid*="attachment"]',
+            '[data-test-id*="attachment"]',
             '[data-testid*="upload"]',
+            '[data-test-id*="upload"]',
             '[data-testid*="image"]',
+            '[data-test-id*="image"]',
             '[data-testid*="preview"]',
+            '[data-test-id*="preview"]',
             '[aria-label*="download" i]',
             '[aria-label*="attachment" i]',
             '[aria-label*="image" i]',
@@ -1829,6 +2026,70 @@
             }
         });
         return Array.from(results);
+    }
+    function labelLooksLikeFileName(value) {
+        const text = normalizeWhitespace(value || "");
+        return looksLikeFilename(text) || isLikelyFileNameText(text);
+    }
+    function getAssetCardLabel(card) {
+        if (!(card instanceof HTMLElement)) {
+            return "";
+        }
+        const filenameNode = card.querySelector([
+            "[data-test-id*='filename' i]",
+            "[data-testid*='filename' i]",
+            "[class*='filename' i]",
+            "[aria-label*='.pdf' i]",
+            "[aria-label*='.doc' i]",
+            "[aria-label*='.docx' i]",
+            "[aria-label*='.xls' i]",
+            "[aria-label*='.xlsx' i]",
+            "[aria-label*='.ppt' i]",
+            "[aria-label*='.pptx' i]",
+            "[aria-label*='.csv' i]",
+            "[aria-label*='.txt' i]",
+            "[aria-label*='.md' i]",
+            "[aria-label*='.json' i]",
+            "[aria-label*='.zip' i]",
+            "[aria-label*='.png' i]",
+            "[aria-label*='.jpg' i]",
+            "[aria-label*='.jpeg' i]",
+            "[aria-label*='.webp' i]",
+            "[aria-label*='.gif' i]",
+        ].join(", "));
+        if (filenameNode instanceof HTMLElement) {
+            const filenameLabel = filenameNode.getAttribute("aria-label") ||
+                filenameNode.getAttribute("title") ||
+                filenameNode.getAttribute("download") ||
+                filenameNode.textContent ||
+                "";
+            if (labelLooksLikeFileName(filenameLabel)) {
+                return filenameLabel;
+            }
+        }
+        const cardText = card.textContent || "";
+        if (labelLooksLikeFileName(cardText)) {
+            return cardText;
+        }
+        const directLabel = card.getAttribute("aria-label") ||
+            card.getAttribute("title") ||
+            card.getAttribute("download") ||
+            "";
+        if (labelLooksLikeFileName(directLabel)) {
+            return directLabel;
+        }
+        const labelledChild = card.querySelector("[aria-label], [title], [download]");
+        if (labelledChild instanceof HTMLElement) {
+            const childLabel = labelledChild.getAttribute("aria-label") ||
+                labelledChild.getAttribute("title") ||
+                labelledChild.getAttribute("download") ||
+                labelledChild.textContent ||
+                "";
+            if (labelLooksLikeFileName(childLabel)) {
+                return childLabel;
+            }
+        }
+        return cardText;
     }
     function isLikelyAttachmentAnchor(anchor) {
         const rawHref = anchor.getAttribute("href") || "";
@@ -1863,6 +2124,22 @@
         }
         return false;
     }
+    function isDecorativeAssetImage(image, url, alt) {
+        const lowerUrl = (url || "").toLowerCase();
+        const lowerAlt = (alt || "").toLowerCase();
+        const className = typeof image.className === "string" ? image.className.toLowerCase() : "";
+        const testId = (image.getAttribute("data-test-id") || image.getAttribute("data-testid") || "").toLowerCase();
+        if (/\bicon\b/.test(className) || /\bicon\b/.test(testId) || /\bicon\b/.test(lowerAlt)) {
+            return true;
+        }
+        if (lowerUrl.includes("drive-thirdparty.googleusercontent.com/32/type/") ||
+            lowerUrl.includes("gstatic.com/images/branding/productlogos/") ||
+            lowerUrl.includes("gstatic.com/lamda/images/gemini_sparkle") ||
+            lowerUrl.includes("/favicon")) {
+            return true;
+        }
+        return false;
+    }
     function extractMessageAssets(...roots) {
         const validRoots = roots.filter((root) => root instanceof HTMLElement);
         if (!validRoots.length) {
@@ -1876,11 +2153,11 @@
                     return;
                 }
                 const url = normalizeAssetUrl(node.currentSrc || node.getAttribute("src") || "");
-                if (!url || seen.has(`image:${url}`)) {
+                const alt = normalizeWhitespace(node.getAttribute("alt") || "");
+                if (!url || seen.has(`image:${url}`) || isDecorativeAssetImage(node, url, alt)) {
                     return;
                 }
                 seen.add(`image:${url}`);
-                const alt = normalizeWhitespace(node.getAttribute("alt") || "");
                 const filename = sanitizeAssetLabel(fileNameFromUrl(url), alt || "image");
                 assets.push({
                     kind: "image",
@@ -1911,7 +2188,7 @@
         });
         validRoots.flatMap((root) => findCandidateAssetCards(root)).forEach((card, index) => {
             const anchor = card.closest("a[href]") || card.querySelector("a[href]");
-            if (anchor instanceof HTMLAnchorElement) {
+            if (anchor instanceof HTMLAnchorElement && isLikelyAttachmentAnchor(anchor)) {
                 const url = normalizeAssetUrl(anchor.getAttribute("href") || "");
                 if (url && !seen.has(`file:${url}`) && !seen.has(`image:${url}`)) {
                     const label = getAnchorLabel(anchor) || card.textContent || "";
@@ -1926,15 +2203,15 @@
                 return;
             }
             const directUrl = findDirectAssetUrl(card);
+            const cardLabel = getAssetCardLabel(card);
             if (directUrl &&
                 !seen.has(`file:${directUrl}`) &&
                 !seen.has(`image:${directUrl}`) &&
-                isCompatibleFileCardUrl(directUrl, card.textContent || "", findFileIdHints(card))) {
-                const label = card.textContent || "";
+                isCompatibleFileCardUrl(directUrl, cardLabel, findFileIdHints(card))) {
                 assets.push({
                     kind: "file",
                     url: directUrl,
-                    filename: sanitizeAssetLabel(label || fileNameFromUrl(directUrl), `attachment-${index + 1}`),
+                    filename: sanitizeAssetLabel(cardLabel || fileNameFromUrl(directUrl), `attachment-${index + 1}`),
                     mimeType: inferMimeTypeFromUrl(directUrl),
                 });
                 seen.add(`file:${directUrl}`);
@@ -1943,19 +2220,18 @@
             const reactMetadata = extractReactAssetMetadata(card);
             const reactUrl = reactMetadata.urls.find((candidate) => !seen.has(`file:${candidate}`) &&
                 !seen.has(`image:${candidate}`) &&
-                isCompatibleFileCardUrl(candidate, card.textContent || reactMetadata.fileNames[0] || "", reactMetadata.fileIds));
+                isCompatibleFileCardUrl(candidate, cardLabel || reactMetadata.fileNames[0] || "", reactMetadata.fileIds));
             if (reactUrl) {
-                const label = card.textContent || reactMetadata.fileNames[0] || "";
                 assets.push({
                     kind: "file",
                     url: reactUrl,
-                    filename: sanitizeAssetLabel(label || fileNameFromUrl(reactUrl), `attachment-${index + 1}`),
+                    filename: sanitizeAssetLabel(cardLabel || reactMetadata.fileNames[0] || fileNameFromUrl(reactUrl), `attachment-${index + 1}`),
                     mimeType: inferMimeTypeFromUrl(reactUrl),
                 });
                 seen.add(`file:${reactUrl}`);
                 return;
             }
-            const text = normalizeWhitespace(card.textContent || "");
+            const text = normalizeWhitespace(cardLabel);
             if (!isLikelyFileNameText(text)) {
                 return;
             }
@@ -1990,7 +2266,196 @@
         });
         return assets;
     }
-    function collectConversation() {
+    function getGeminiCandidateHost(node, role) {
+        if (!(node instanceof HTMLElement)) {
+            return null;
+        }
+        if (role === "user") {
+            return node.closest("user-query") || node.closest("[data-testid*='user-query' i]") || node.closest("[data-test-id*='user-query' i]") || node;
+        }
+        return (node.closest("model-response") ||
+            node.closest("response-container") ||
+            node.closest("[data-testid*='model-response' i]") ||
+            node.closest("[data-test-id*='model-response' i]") ||
+            node);
+    }
+    function isGeminiMessageHostNoise(host, role) {
+        const text = readExportText(host);
+        if (!text && !host.querySelector("img, a[href], [data-testid*='file' i], [data-test-id*='file' i]")) {
+            return true;
+        }
+        if (text.length <= 2 && role === "assistant") {
+            return true;
+        }
+        return false;
+    }
+    function addGeminiMessageHost(results, host, role) {
+        if (!(host instanceof HTMLElement) || (role !== "assistant" && isGeminiMessageHostNoise(host, role))) {
+            return;
+        }
+        const existing = results.find((item) => item.role === role && (item.host === host || item.host.contains(host) || host.contains(item.host)));
+        if (!existing) {
+            results.push({
+                role,
+                host,
+            });
+            return;
+        }
+        if (host.contains(existing.host) && host.tagName.toLowerCase() !== existing.host.tagName.toLowerCase()) {
+            existing.host = host;
+        }
+    }
+    function resolveGeminiMessageHosts() {
+        const results = [];
+        document.querySelectorAll("user-query").forEach((node) => {
+            if (node instanceof HTMLElement) {
+                results.push({
+                    role: "user",
+                    host: node,
+                });
+            }
+        });
+        document.querySelectorAll("model-response").forEach((node) => {
+            if (node instanceof HTMLElement) {
+                results.push({
+                    role: "assistant",
+                    host: node,
+                });
+            }
+        });
+        if (!results.some((item) => item.role === "user")) {
+            document.querySelectorAll(GEMINI_USER_HOST_SELECTOR).forEach((node) => {
+                const host = getGeminiCandidateHost(node, "user");
+                addGeminiMessageHost(results, host, "user");
+            });
+        }
+        if (!results.some((item) => item.role === "assistant")) {
+            document.querySelectorAll(`${GEMINI_ASSISTANT_HOST_SELECTOR}, ${GEMINI_ASSISTANT_FALLBACK_HOST_SELECTOR}`).forEach((node) => {
+                const host = getGeminiCandidateHost(node, "assistant");
+                addGeminiMessageHost(results, host, "assistant");
+            });
+        }
+        return results
+            .filter((item, index, list) => {
+            if (!(item.host instanceof HTMLElement)) {
+                return false;
+            }
+            return !list.some((candidate, candidateIndex) => {
+                return (candidateIndex < index &&
+                    candidate.role === item.role &&
+                    candidate.host instanceof HTMLElement &&
+                    (candidate.host === item.host || candidate.host.contains(item.host) || item.host.contains(candidate.host)));
+            });
+        })
+            .sort((left, right) => {
+            if (left.host === right.host) {
+                return left.role === "user" ? -1 : 1;
+            }
+            const position = left.host.compareDocumentPosition(right.host);
+            if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+                return -1;
+            }
+            if (position & Node.DOCUMENT_POSITION_PRECEDING) {
+                return 1;
+            }
+            return 0;
+        });
+    }
+    function resolveGeminiMessageBody(host, role) {
+        if (!(host instanceof HTMLElement)) {
+            return null;
+        }
+        const selector = role === "user" ? GEMINI_USER_BODY_SELECTOR : GEMINI_ASSISTANT_BODY_SELECTOR;
+        const body = host.matches(selector) ? host : host.querySelector(selector);
+        return body instanceof HTMLElement ? body : host;
+    }
+    function ensureGeminiTurnId(host, index) {
+        if (!(host instanceof HTMLElement)) {
+            return `gemini-turn-${index + 1}`;
+        }
+        const existing = host.getAttribute(GEMINI_TURN_ID_ATTR);
+        if (existing) {
+            return existing;
+        }
+        geminiTurnSequence += 1;
+        const id = `gemini-turn-${geminiTurnSequence}`;
+        host.setAttribute(GEMINI_TURN_ID_ATTR, id);
+        return id;
+    }
+    function buildGeminiHostSelectorHint(host, body, turnId) {
+        const bodyId = body instanceof HTMLElement ? body.id : "";
+        const hostId = host instanceof HTMLElement ? host.id : "";
+        const idSelector = buildIdSelector(bodyId || hostId);
+        if (idSelector) {
+            return idSelector;
+        }
+        return `[${GEMINI_TURN_ID_ATTR}="${escapeCssAttributeValue(turnId)}"]`;
+    }
+    function collectGeminiConversation() {
+        const hosts = resolveGeminiMessageHosts();
+        const messages = [];
+        let userMessageIndex = 0;
+        let assistantMessageIndex = 0;
+        hosts.forEach((item, index) => {
+            const turnId = ensureGeminiTurnId(item.host, index);
+            const body = resolveGeminiMessageBody(item.host, item.role);
+            if (!(body instanceof HTMLElement)) {
+                return;
+            }
+            const assets = extractMessageAssets(item.host, body);
+            if (item.role === "user") {
+                const text = readExportText(body) || readExportText(item.host);
+                if (!text && !assets.length) {
+                    return;
+                }
+                userMessageIndex += 1;
+                messages.push({
+                    id: `${turnId}:user`,
+                    turnId,
+                    platform: "gemini",
+                    assistantLabel: "gemini",
+                    hostSelectorHint: buildGeminiHostSelectorHint(item.host, body, turnId),
+                    index: userMessageIndex,
+                    role: "user",
+                    text,
+                    markdown: text,
+                    html: body.innerHTML,
+                    assets,
+                });
+                return;
+            }
+            const markdown = serializeAssistantMarkdown(body);
+            const text = readExportText(body) || markdown;
+            if (!text && !markdown && !assets.length) {
+                return;
+            }
+            assistantMessageIndex += 1;
+            messages.push({
+                id: `${turnId}:assistant`,
+                turnId,
+                platform: "gemini",
+                assistantLabel: "gemini",
+                hostSelectorHint: buildGeminiHostSelectorHint(item.host, body, turnId),
+                index: assistantMessageIndex,
+                role: "assistant",
+                text,
+                markdown: markdown || text,
+                html: body.innerHTML,
+                assets,
+            });
+        });
+        return {
+            metadata: {
+                title: cleanConversationTitle(),
+                url: window.location.href,
+                exportedAt: new Date().toISOString(),
+                messageCount: messages.length,
+                platform: "gemini",
+            },
+            messages,
+        };
+    }
+    function collectChatGPTConversation() {
         const turns = resolveTurns();
         const messages = [];
         let userMessageIndex = 0;
@@ -2006,6 +2471,8 @@
                     messages.push({
                         id: `${turnId}:user`,
                         turnId,
+                        platform: "chatgpt",
+                        assistantLabel: "gpt",
                         index: userMessageIndex,
                         role: "user",
                         text,
@@ -2034,6 +2501,8 @@
             messages.push({
                 id: `${turnId}:assistant`,
                 turnId,
+                platform: "chatgpt",
+                assistantLabel: "gpt",
                 index: assistantMessageIndex,
                 role: "assistant",
                 text,
@@ -2048,9 +2517,16 @@
                 url: window.location.href,
                 exportedAt: new Date().toISOString(),
                 messageCount: messages.length,
+                platform: "chatgpt",
             },
             messages,
         };
+    }
+    function collectConversation() {
+        if (isGeminiPage()) {
+            return collectGeminiConversation();
+        }
+        return collectChatGPTConversation();
     }
     function applySelection(conversation) {
         if (!selectionLoaded) {
@@ -2254,7 +2730,9 @@
         if (!turnId) {
             return null;
         }
-        return document.querySelector(`section[data-testid="${turnId}"]`);
+        const escapedTurnId = escapeCssAttributeValue(turnId);
+        return (document.querySelector(`section[data-testid="${escapedTurnId}"]`) ||
+            document.querySelector(`[${GEMINI_TURN_ID_ATTR}="${escapedTurnId}"]`));
     }
     function findAttachmentTrigger(message, asset) {
         const turn = findTurnElement(message.turnId);

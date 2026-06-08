@@ -18,7 +18,12 @@ export interface ExportAsset {
 export interface ConversationMessage {
   id: string;
   role: MessageRole;
+  turnId?: string;
+  platform?: "chatgpt" | "gemini";
+  assistantLabel?: string;
+  index?: number;
   text: string;
+  markdown?: string;
   html?: string;
   assets?: ExportAsset[];
   hostSelectorHint?: string;
@@ -29,6 +34,7 @@ export interface ConversationMetadata {
   url: string;
   exportedAt: string;
   messageCount: number;
+  platform?: "chatgpt" | "gemini";
 }
 
 export interface CollectedConversation {

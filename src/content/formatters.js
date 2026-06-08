@@ -30,7 +30,7 @@
         return JSON.stringify(conversation, null, 2);
     }
     function getMessageDisplayName(message) {
-        return `${message.role === "user" ? "user" : "gpt"}${message.index}`;
+        return `${message.role === "user" ? "user" : message.assistantLabel || "gpt"}${message.index}`;
     }
     function toMarkdown(conversation) {
         const lines = [
