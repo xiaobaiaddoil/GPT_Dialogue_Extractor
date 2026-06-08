@@ -4,14 +4,22 @@
   "short_name": "GPT Extractor",
   "version": "0.2.0",
   "description": "Export the current ChatGPT conversation as JSON, Markdown, or PDF from the live page DOM.",
-  "permissions": ["downloads"],
+  "permissions": [
+    "downloads"
+  ],
   "background": {
     "service_worker": "src/background/index.js"
   },
-  "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
       "js": [
         "src/content/binary-utils.js",
         "src/content/page-bridge.js",
@@ -21,14 +29,21 @@
         "src/content/download-bridge.js",
         "src/content/index.js"
       ],
-      "css": ["src/content/styles.css"],
-      "run_at": "document_idle"
+      "css": [
+        "src/content/styles.css"
+      ],
+      "run_at": "document_start"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["src/content/page-hook.js"],
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+      "resources": [
+        "src/content/page-hook.js"
+      ],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ]
     }
   ]
 }
