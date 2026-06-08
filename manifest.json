@@ -3,15 +3,25 @@
   "name": "GPT Dialogue Extractor",
   "short_name": "GPT Extractor",
   "version": "0.2.0",
-  "description": "Export the current ChatGPT conversation as JSON, Markdown, or PDF from the live page DOM.",
+  "description": "Export the current ChatGPT or DeepSeek conversation as JSON, Markdown, PDF, or ZIP from the live page DOM.",
   "permissions": ["downloads"],
   "background": {
     "service_worker": "src/background/index.js"
   },
-  "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+  "host_permissions": [
+    "https://chatgpt.com/*",
+    "https://chat.openai.com/*",
+    "https://chat.deepseek.com/*",
+    "https://www.deepseek.com/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.deepseek.com/*"
+      ],
       "js": [
         "src/content/binary-utils.js",
         "src/content/page-bridge.js",
@@ -28,7 +38,12 @@
   "web_accessible_resources": [
     {
       "resources": ["src/content/page-hook.js"],
-      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"]
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://chat.openai.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.deepseek.com/*"
+      ]
     }
   ]
 }

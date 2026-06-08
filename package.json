@@ -2,7 +2,7 @@
   "name": "chatgpt-exporter",
   "version": "0.2.0",
   "private": true,
-  "description": "A browser extension for exporting ChatGPT conversations using TypeScript sources and DOM-based extraction.",
+  "description": "A browser extension for exporting ChatGPT and DeepSeek conversations using TypeScript sources and DOM-based extraction.",
   "license": "MIT",
   "type": "module",
   "scripts": {

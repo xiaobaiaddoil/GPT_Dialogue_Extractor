@@ -4,6 +4,8 @@ export type MessageRole = "user" | "assistant" | "system" | "tool";
 
 export type ExportAssetKind = "image" | "file";
 
+export type ConversationPlatform = "chatgpt" | "deepseek";
+
 export interface ExportAsset {
   kind: ExportAssetKind;
   url: string;
@@ -19,6 +21,11 @@ export interface ConversationMessage {
   id: string;
   role: MessageRole;
   text: string;
+  platform?: ConversationPlatform;
+  assistantLabel?: string;
+  turnId?: string;
+  index?: number;
+  markdown?: string;
   html?: string;
   assets?: ExportAsset[];
   hostSelectorHint?: string;
@@ -29,6 +36,7 @@ export interface ConversationMetadata {
   url: string;
   exportedAt: string;
   messageCount: number;
+  platform?: ConversationPlatform;
 }
 
 export interface CollectedConversation {

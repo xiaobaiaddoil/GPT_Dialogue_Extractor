@@ -13,6 +13,32 @@
     const ASSISTANT_PRIMARY_SELECTOR = '[data-message-author-role="assistant"][data-turn-start-message="true"]';
     const ASSISTANT_BODY_SELECTOR = ".markdown";
     const CODE_CONTENT_SELECTOR = ".cm-content";
+    const DEEPSEEK_TURN_ID_ATTR = "data-cge-deepseek-turn-id";
+    const DEEPSEEK_VIRTUAL_ITEM_SELECTOR = "[data-virtual-list-item-key]";
+    const DEEPSEEK_PRIMARY_MESSAGE_HOST_SELECTOR = [
+        DEEPSEEK_VIRTUAL_ITEM_SELECTOR,
+        "div.dad65929",
+        "div._4f9bf79",
+    ].join(", ");
+    const DEEPSEEK_MESSAGE_HOST_SELECTOR = [
+        DEEPSEEK_PRIMARY_MESSAGE_HOST_SELECTOR,
+        ".ds-message",
+        "[data-testid*='message' i]",
+        "[class*='message' i]",
+        "[class*='chat-message' i]",
+    ].join(", ");
+    const DEEPSEEK_USER_BODY_SELECTOR = [
+        ".fbb737a4",
+        "[class*='user-message' i]",
+        "[class*='user_text' i]",
+        "[class*='user-text' i]",
+    ].join(", ");
+    const DEEPSEEK_ASSISTANT_MAIN_BODY_SELECTOR = ".ds-markdown.ds-assistant-message-main-content";
+    const DEEPSEEK_ASSISTANT_BODY_SELECTOR = [
+        DEEPSEEK_ASSISTANT_MAIN_BODY_SELECTOR,
+        ".ds-markdown",
+        "[class*='markdown' i]",
+    ].join(", ");
     const MATH_ROOT_SELECTOR = [
         ".katex-display",
         ".math-display",
@@ -63,6 +89,9 @@
     const TIMELINE_MIN_MARKERS = 16;
     const TIMELINE_MAX_MARKERS = 16;
     const TIMELINE_FOCUS_WINDOW = 9;
+    const DEEPSEEK_HISTORY_MAX_SCROLL_STEPS = 120;
+    const DEEPSEEK_HISTORY_STABLE_ROUNDS = 4;
+    const DEEPSEEK_HISTORY_SCROLL_RATIO = 0.82;
     let injectTimer = 0;
     let exportInFlight = false;
     let selectionInFlight = false;
@@ -79,6 +108,10 @@
     let timelineLockedMessageId = "";
     let timelineLockedUntil = 0;
     let timelineDirectoryExpanded = false;
+    let deepSeekTurnSequence = 0;
+    let deepSeekHistoryLoadInFlight = false;
+    const deepSeekGeneratedTurnIds = new WeakMap();
+    const deepSeekTurnHostCache = new Map();
     const documentAssetHintCache = new Map();
     const primedNativeAssetKeys = new Set();
     function delay(ms) {
@@ -89,15 +122,33 @@
     function normalizeWhitespace(value) {
         return value.replace(/\r\n/g, "\n").replace(/\u00a0/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     }
-    function sanitizeFileName(value) {
+    function sanitizeFileName(value, fallback = "chatgpt-conversation") {
         const cleaned = value
             .replace(/[<>:"/\\|?*\u0000-\u001f]/g, " ")
             .replace(/\s+/g, " ")
             .trim();
-        return cleaned || "chatgpt-conversation";
+        return cleaned || fallback;
     }
     function escapeRegExp(value) {
         return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+    function escapeCssAttributeValue(value) {
+        return String(value)
+            .replace(/\\/g, "\\\\")
+            .replace(/"/g, '\\"')
+            .replace(/\n/g, "\\A ");
+    }
+    function buildAttributeSelector(attributeName, value) {
+        return `[${attributeName}="${escapeCssAttributeValue(value)}"]`;
+    }
+    function buildIdSelector(id) {
+        if (!id) {
+            return "";
+        }
+        if (window.CSS && typeof window.CSS.escape === "function") {
+            return `#${window.CSS.escape(id)}`;
+        }
+        return buildAttributeSelector("id", id);
     }
     function buildAssetTrackingKey(message, asset) {
         const turnPart = normalizeWhitespace((message && (message.turnId || message.id)) || "");
@@ -110,15 +161,34 @@
         }
         return conversation.messages.map((message) => message.id).join("|");
     }
+    function isDeepSeekPage() {
+        return (window.location.hostname === "chat.deepseek.com" ||
+            (window.location.hostname === "www.deepseek.com" && window.location.pathname.startsWith("/chat")));
+    }
+    function isChatGPTPage() {
+        return window.location.hostname === "chatgpt.com" || window.location.hostname === "chat.openai.com";
+    }
+    function isSupportedConversationPage() {
+        return isChatGPTPage() || isDeepSeekPage();
+    }
+    function getAssistantDisplayLabel(message) {
+        if (message && typeof message.assistantLabel === "string" && message.assistantLabel.trim()) {
+            return message.assistantLabel.trim();
+        }
+        return message && message.platform === "deepseek" ? "deepseek" : "gpt";
+    }
     function getMessageDisplayName(message) {
-        return `${message.role === "user" ? "user" : "gpt"}${message.index}`;
+        return `${message.role === "user" ? "user" : getAssistantDisplayLabel(message)}${message.index}`;
     }
     function cleanConversationTitle() {
-        const rawTitle = document.title || "chatgpt-conversation";
+        const fallback = isDeepSeekPage() ? "deepseek-conversation" : "chatgpt-conversation";
+        const rawTitle = document.title || fallback;
         return sanitizeFileName(rawTitle
             .replace(/\s*-\s*ChatGPT\s*$/i, "")
             .replace(/\s*\|\s*ChatGPT\s*$/i, "")
-            .trim());
+            .replace(/\s*-\s*DeepSeek\s*$/i, "")
+            .replace(/\s*\|\s*DeepSeek\s*$/i, "")
+            .trim(), fallback);
     }
     function installPageHookBridge() {
         const pageBridge = window.ChatGPTExporterPageBridge;
@@ -334,11 +404,42 @@
             behavior: "smooth",
         });
     }
-    function resolveTimelineTurn(message) {
-        if (!message || typeof message.turnId !== "string") {
+    function querySelectorSafely(selector) {
+        if (!selector) {
             return null;
         }
-        const turn = document.querySelector(`section[data-testid="${message.turnId}"]`);
+        try {
+            return document.querySelector(selector);
+        }
+        catch {
+            return null;
+        }
+    }
+    function resolveTimelineTurn(message) {
+        if (!message) {
+            return null;
+        }
+        if (message.platform === "deepseek") {
+            const hinted = querySelectorSafely(message.hostSelectorHint || "");
+            if (hinted instanceof HTMLElement) {
+                return hinted;
+            }
+            if (typeof message.turnId === "string" && message.turnId) {
+                const cachedTurn = deepSeekTurnHostCache.get(message.turnId);
+                if (cachedTurn instanceof HTMLElement && cachedTurn.isConnected) {
+                    return cachedTurn;
+                }
+                const byTurnId = querySelectorSafely(buildAttributeSelector(DEEPSEEK_TURN_ID_ATTR, message.turnId));
+                if (byTurnId instanceof HTMLElement) {
+                    return byTurnId;
+                }
+            }
+            return null;
+        }
+        if (typeof message.turnId !== "string" || !message.turnId) {
+            return null;
+        }
+        const turn = document.querySelector(`section${buildAttributeSelector("data-testid", message.turnId)}`);
         if (!(turn instanceof HTMLElement)) {
             return null;
         }
@@ -348,6 +449,10 @@
         const turn = resolveTimelineTurn(message);
         if (!(turn instanceof HTMLElement)) {
             return null;
+        }
+        if (message.platform === "deepseek") {
+            const body = resolveDeepSeekMessageBody(turn, message.role);
+            return body instanceof HTMLElement ? body : turn;
         }
         const userBody = resolveUserBody(turn);
         return userBody instanceof HTMLElement ? userBody : turn;
@@ -410,9 +515,18 @@
         }
         else {
             target.scrollIntoView({
-                block: "start",
+                block: message.platform === "deepseek" ? "center" : "start",
                 behavior: "smooth",
             });
+        }
+        if (message.platform === "deepseek") {
+            window.setTimeout(() => {
+                target.scrollIntoView({
+                    block: "center",
+                    inline: "nearest",
+                    behavior: "smooth",
+                });
+            }, 280);
         }
         activeTimelineMessageId = message.id;
         timelineLockedMessageId = message.id;
@@ -742,6 +856,167 @@
         renderTimelineDirectory();
         updateTimelineActiveStyles();
     }
+    function isEveryMessageSelected(conversation) {
+        return Boolean(conversation &&
+            Array.isArray(conversation.messages) &&
+            conversation.messages.length > 0 &&
+            conversation.messages.every((message) => selectedMessageIds.has(message.id)));
+    }
+    function getDeepSeekMessageSortKey(message) {
+        const value = String((message && (message.turnId || message.id)) || "");
+        const match = value.match(/deepseek-turn-(\d+)/i);
+        return match ? Number(match[1]) : Number.POSITIVE_INFINITY;
+    }
+    function getMessageRoleSortKey(message) {
+        if (message && message.role === "user") {
+            return 0;
+        }
+        if (message && message.role === "assistant") {
+            return 1;
+        }
+        return 2;
+    }
+    function mergeDeepSeekConversationSnapshots(snapshots) {
+        const validSnapshots = snapshots.filter((snapshot) => snapshot && Array.isArray(snapshot.messages));
+        const fallback = {
+            metadata: {
+                title: cleanConversationTitle(),
+                url: window.location.href,
+                exportedAt: new Date().toISOString(),
+                messageCount: 0,
+                platform: "deepseek",
+            },
+            messages: [],
+        };
+        if (!validSnapshots.length) {
+            return fallback;
+        }
+        const messagesById = new Map();
+        const insertionOrder = new Map();
+        let sequence = 0;
+        validSnapshots.forEach((snapshot) => {
+            snapshot.messages.forEach((message) => {
+                if (!message || !message.id) {
+                    return;
+                }
+                if (!insertionOrder.has(message.id)) {
+                    insertionOrder.set(message.id, sequence);
+                    sequence += 1;
+                }
+                messagesById.set(message.id, {
+                    ...(messagesById.get(message.id) || {}),
+                    ...message,
+                });
+            });
+        });
+        const messages = Array.from(messagesById.values()).sort((left, right) => {
+            const leftKey = getDeepSeekMessageSortKey(left);
+            const rightKey = getDeepSeekMessageSortKey(right);
+            if (Number.isFinite(leftKey) && Number.isFinite(rightKey) && leftKey !== rightKey) {
+                return leftKey - rightKey;
+            }
+            const roleDelta = getMessageRoleSortKey(left) - getMessageRoleSortKey(right);
+            if (roleDelta) {
+                return roleDelta;
+            }
+            return (insertionOrder.get(left.id) || 0) - (insertionOrder.get(right.id) || 0);
+        });
+        const latestMetadata = validSnapshots[validSnapshots.length - 1].metadata || fallback.metadata;
+        return {
+            metadata: {
+                ...latestMetadata,
+                title: latestMetadata.title || cleanConversationTitle(),
+                url: window.location.href,
+                exportedAt: new Date().toISOString(),
+                messageCount: messages.length,
+                platform: "deepseek",
+            },
+            messages,
+        };
+    }
+    function canMergeWithDeepSeekHistory(conversation) {
+        return Boolean(isDeepSeekPage() &&
+            conversation &&
+            conversation.metadata &&
+            conversation.metadata.platform === "deepseek" &&
+            conversation.metadata.url === window.location.href);
+    }
+    async function collectDeepSeekConversationWithHistory() {
+        const firstSnapshot = collectDeepSeekConversation();
+        const scrollContainer = resolveScrollContainer();
+        if (!(scrollContainer instanceof HTMLElement) || !firstSnapshot.messages.length) {
+            return firstSnapshot;
+        }
+        const snapshots = [firstSnapshot];
+        const initialScrollTop = scrollContainer.scrollTop;
+        const previousScrollBehavior = scrollContainer.style.scrollBehavior;
+        let mergedConversation = mergeDeepSeekConversationSnapshots(snapshots);
+        let previousSignature = getConversationSignature(mergedConversation);
+        let stableRounds = 0;
+        deepSeekHistoryLoadInFlight = true;
+        scrollContainer.style.scrollBehavior = "auto";
+        try {
+            for (let step = 0; step < DEEPSEEK_HISTORY_MAX_SCROLL_STEPS; step += 1) {
+                const beforeTop = scrollContainer.scrollTop;
+                const stepSize = Math.max(360, Math.floor((scrollContainer.clientHeight || window.innerHeight || 800) * DEEPSEEK_HISTORY_SCROLL_RATIO));
+                const nextTop = Math.max(0, beforeTop - stepSize);
+                scrollContainer.scrollTo({
+                    top: nextTop,
+                    behavior: "auto",
+                });
+                scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
+                await delay(step < 4 ? 360 : 220);
+                const snapshot = collectDeepSeekConversation();
+                if (snapshot.messages.length) {
+                    snapshots.push(snapshot);
+                }
+                mergedConversation = mergeDeepSeekConversationSnapshots(snapshots);
+                const nextSignature = getConversationSignature(mergedConversation);
+                const scrollChanged = Math.abs(scrollContainer.scrollTop - beforeTop) > 2;
+                const foundNewMessages = nextSignature !== previousSignature;
+                if (foundNewMessages) {
+                    previousSignature = nextSignature;
+                    stableRounds = 0;
+                    setStatus(`正在向上加载 DeepSeek 历史消息，已读取 ${mergedConversation.messages.length} 条…`, "muted");
+                }
+                else if (!scrollChanged || scrollContainer.scrollTop <= 2) {
+                    stableRounds += 1;
+                }
+                else {
+                    stableRounds = 0;
+                }
+                if (stableRounds >= DEEPSEEK_HISTORY_STABLE_ROUNDS) {
+                    break;
+                }
+            }
+        }
+        finally {
+            scrollContainer.scrollTo({
+                top: initialScrollTop,
+                behavior: "auto",
+            });
+            scrollContainer.dispatchEvent(new Event("scroll", { bubbles: true }));
+            await delay(180);
+            if (previousScrollBehavior) {
+                scrollContainer.style.scrollBehavior = previousScrollBehavior;
+            }
+            else {
+                scrollContainer.style.removeProperty("scroll-behavior");
+            }
+            deepSeekHistoryLoadInFlight = false;
+        }
+        const restoredSnapshot = collectDeepSeekConversation();
+        if (restoredSnapshot.messages.length) {
+            snapshots.push(restoredSnapshot);
+        }
+        return mergeDeepSeekConversationSnapshots(snapshots);
+    }
+    async function collectConversationForAction(options = {}) {
+        if (isDeepSeekPage() && options.loadHistory) {
+            return collectDeepSeekConversationWithHistory();
+        }
+        return collectConversation();
+    }
     async function prepareSelection(forceReload) {
         if (selectionInFlight) {
             return;
@@ -750,13 +1025,16 @@
         setSelectionButtonsDisabled(true);
         try {
             setStatus("正在读取当前会话消息列表…", "muted");
+            const wasFullySelected = selectionLoaded && isEveryMessageSelected(latestConversation);
             if (forceReload || !latestConversation) {
-                latestConversation = collectConversation();
+                latestConversation = await collectConversationForAction({
+                    loadHistory: forceReload && isDeepSeekPage(),
+                });
             }
             if (!latestConversation || !latestConversation.messages.length) {
                 throw new Error("没有读取到可供选择的消息。");
             }
-            if (!selectionLoaded) {
+            if (!selectionLoaded || wasFullySelected) {
                 selectedMessageIds = new Set(latestConversation.messages.map((message) => message.id));
             }
             else {
@@ -779,20 +1057,32 @@
         }
     }
     function syncLiveConversation() {
+        if (deepSeekHistoryLoadInFlight) {
+            return;
+        }
         const turns = resolveTurns();
         if (!turns.length) {
             return;
         }
-        const nextConversation = collectConversation();
+        const wasFullySelected = selectionLoaded && isEveryMessageSelected(latestConversation);
+        const visibleConversation = collectConversation();
+        const nextConversation = canMergeWithDeepSeekHistory(latestConversation)
+            ? mergeDeepSeekConversationSnapshots([latestConversation, visibleConversation])
+            : visibleConversation;
         const nextSignature = getConversationSignature(nextConversation);
         const selectionChanged = nextSignature !== lastSelectionSignature;
         const timelineChanged = nextSignature !== lastTimelineSignature;
         latestConversation = nextConversation;
         if (selectionLoaded) {
             if (selectionChanged) {
-                selectedMessageIds = new Set(latestConversation.messages
-                    .map((message) => message.id)
-                    .filter((messageId) => selectedMessageIds.has(messageId)));
+                if (wasFullySelected) {
+                    selectedMessageIds = new Set(latestConversation.messages.map((message) => message.id));
+                }
+                else {
+                    selectedMessageIds = new Set(latestConversation.messages
+                        .map((message) => message.id)
+                        .filter((messageId) => selectedMessageIds.has(messageId)));
+                }
                 renderSelectionList(latestConversation);
                 lastSelectionSignature = nextSignature;
             }
@@ -839,7 +1129,7 @@
     }
     function ensureToolbar() {
         const headerActions = document.querySelector(HEADER_ACTIONS_SELECTOR);
-        if (!headerActions) {
+        if (!headerActions && !isDeepSeekPage()) {
             return;
         }
         if (document.getElementById(WRAPPER_ID)) {
@@ -857,7 +1147,22 @@
             togglePanel();
         });
         wrapper.append(exportButton);
-        headerActions.prepend(wrapper);
+        if (headerActions) {
+            headerActions.prepend(wrapper);
+        }
+        else {
+            wrapper.style.position = "fixed";
+            wrapper.style.top = "16px";
+            wrapper.style.right = "16px";
+            wrapper.style.zIndex = "2147483647";
+            wrapper.style.padding = "6px";
+            wrapper.style.border = "1px solid rgba(148, 163, 184, 0.24)";
+            wrapper.style.borderRadius = "999px";
+            wrapper.style.background = "rgba(255, 255, 255, 0.92)";
+            wrapper.style.backdropFilter = "blur(12px)";
+            wrapper.style.boxShadow = "0 14px 32px rgba(15, 23, 42, 0.14)";
+            document.documentElement.append(wrapper);
+        }
         ensurePanel();
         ensureTimelinePanel();
     }
@@ -1129,6 +1434,9 @@
         }, { passive: true });
     }
     function resolveTurns() {
+        if (isDeepSeekPage()) {
+            return resolveDeepSeekMessageHosts().map((item) => item.host);
+        }
         return Array.from(document.querySelectorAll(TURN_SELECTOR));
     }
     function isScrollable(element) {
@@ -1161,6 +1469,171 @@
         }
         const nodes = Array.from(turn.querySelectorAll(ASSISTANT_ROLE_SELECTOR));
         return nodes[nodes.length - 1] || null;
+    }
+    function resolveDeepSeekMessageHost(body) {
+        if (!(body instanceof HTMLElement)) {
+            return null;
+        }
+        let current = body;
+        const candidates = [];
+        while (current && current !== document.body && current !== document.documentElement) {
+            if (current.matches(DEEPSEEK_VIRTUAL_ITEM_SELECTOR)) {
+                return current;
+            }
+            if (current.matches(DEEPSEEK_PRIMARY_MESSAGE_HOST_SELECTOR)) {
+                return current;
+            }
+            if (current.matches(DEEPSEEK_MESSAGE_HOST_SELECTOR)) {
+                candidates.push(current);
+            }
+            current = current.parentElement;
+        }
+        return candidates[0] || body;
+    }
+    function resolveDeepSeekMessageBody(host, role) {
+        if (!(host instanceof HTMLElement)) {
+            return null;
+        }
+        if (role === "assistant") {
+            if (host.matches(DEEPSEEK_ASSISTANT_MAIN_BODY_SELECTOR)) {
+                return host;
+            }
+            const mainBody = host.querySelector(DEEPSEEK_ASSISTANT_MAIN_BODY_SELECTOR);
+            if (mainBody instanceof HTMLElement) {
+                return mainBody;
+            }
+        }
+        const selector = role === "assistant" ? DEEPSEEK_ASSISTANT_BODY_SELECTOR : DEEPSEEK_USER_BODY_SELECTOR;
+        if (host.matches(selector)) {
+            return host;
+        }
+        const body = host.querySelector(selector);
+        return body instanceof HTMLElement ? body : host;
+    }
+    function inferDeepSeekHostRole(host) {
+        if (!(host instanceof HTMLElement)) {
+            return "";
+        }
+        if (host.matches(DEEPSEEK_ASSISTANT_BODY_SELECTOR) || host.querySelector(DEEPSEEK_ASSISTANT_BODY_SELECTOR)) {
+            return "assistant";
+        }
+        if (host.matches(DEEPSEEK_USER_BODY_SELECTOR) || host.querySelector(DEEPSEEK_USER_BODY_SELECTOR)) {
+            return "user";
+        }
+        const roleHint = normalizeWhitespace([
+            host.getAttribute("data-role"),
+            host.getAttribute("data-author"),
+            host.getAttribute("aria-label"),
+            host.getAttribute("class"),
+        ]
+            .filter(Boolean)
+            .join(" ")).toLowerCase();
+        if (/\b(assistant|deepseek|model|ai)\b/.test(roleHint)) {
+            return "assistant";
+        }
+        if (/\b(user|human|you|me)\b/.test(roleHint)) {
+            return "user";
+        }
+        return "";
+    }
+    function hasDeepSeekMessageText(body) {
+        return Boolean(body instanceof HTMLElement && normalizeWhitespace(body.innerText || body.textContent || ""));
+    }
+    function addDeepSeekMessageHost(items, host, role, body) {
+        if (!(host instanceof HTMLElement) || !(body instanceof HTMLElement) || !role || !hasDeepSeekMessageText(body)) {
+            return;
+        }
+        const duplicate = items.some((item) => {
+            if (item.host === host || item.body === body) {
+                return true;
+            }
+            return item.role === role && (item.body.contains(body) || body.contains(item.body));
+        });
+        if (duplicate) {
+            return;
+        }
+        items.push({
+            host,
+            role,
+            body,
+        });
+    }
+    function sortDeepSeekMessageHosts(items) {
+        return items.sort((left, right) => {
+            if (left.host === right.host) {
+                return 0;
+            }
+            const position = left.host.compareDocumentPosition(right.host);
+            if (position & Node.DOCUMENT_POSITION_PRECEDING) {
+                return 1;
+            }
+            if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+                return -1;
+            }
+            return 0;
+        });
+    }
+    function resolveDeepSeekMessageHosts() {
+        const items = [];
+        document.querySelectorAll(DEEPSEEK_PRIMARY_MESSAGE_HOST_SELECTOR).forEach((host) => {
+            if (!(host instanceof HTMLElement)) {
+                return;
+            }
+            const virtualHost = host.closest(DEEPSEEK_VIRTUAL_ITEM_SELECTOR);
+            if (virtualHost instanceof HTMLElement && virtualHost !== host) {
+                return;
+            }
+            const role = inferDeepSeekHostRole(host);
+            const body = resolveDeepSeekMessageBody(host, role);
+            addDeepSeekMessageHost(items, host, role, body);
+        });
+        document.querySelectorAll(`${DEEPSEEK_ASSISTANT_MAIN_BODY_SELECTOR}, ${DEEPSEEK_USER_BODY_SELECTOR}`).forEach((body) => {
+            if (!(body instanceof HTMLElement)) {
+                return;
+            }
+            const role = body.matches(DEEPSEEK_USER_BODY_SELECTOR) ? "user" : "assistant";
+            const host = resolveDeepSeekMessageHost(body);
+            addDeepSeekMessageHost(items, host, role, body);
+        });
+        document.querySelectorAll(DEEPSEEK_MESSAGE_HOST_SELECTOR).forEach((host) => {
+            if (!(host instanceof HTMLElement)) {
+                return;
+            }
+            const role = inferDeepSeekHostRole(host);
+            const body = resolveDeepSeekMessageBody(host, role);
+            addDeepSeekMessageHost(items, host, role, body);
+        });
+        return sortDeepSeekMessageHosts(items);
+    }
+    function ensureDeepSeekTurnId(host) {
+        const virtualListKey = normalizeWhitespace(host.getAttribute("data-virtual-list-item-key") || "");
+        const existingTurnId = normalizeWhitespace(host.getAttribute(DEEPSEEK_TURN_ID_ATTR) || "");
+        let turnId = virtualListKey ? `deepseek-turn-${virtualListKey}` : existingTurnId;
+        if (!turnId) {
+            turnId = deepSeekGeneratedTurnIds.get(host) || "";
+        }
+        if (!turnId) {
+            deepSeekTurnSequence += 1;
+            turnId = `deepseek-turn-${deepSeekTurnSequence}`;
+            deepSeekGeneratedTurnIds.set(host, turnId);
+        }
+        deepSeekTurnHostCache.set(turnId, host);
+        return turnId;
+    }
+    function buildDeepSeekHostSelectorHint(host, body, turnId) {
+        if (host instanceof HTMLElement && host.id) {
+            return buildIdSelector(host.id);
+        }
+        if (host instanceof HTMLElement && host.hasAttribute("data-virtual-list-item-key")) {
+            return buildAttributeSelector("data-virtual-list-item-key", host.getAttribute("data-virtual-list-item-key") || "");
+        }
+        if (body instanceof HTMLElement && body.id) {
+            return buildIdSelector(body.id);
+        }
+        if (host instanceof HTMLElement && host.hasAttribute(DEEPSEEK_TURN_ID_ATTR)) {
+            return buildAttributeSelector(DEEPSEEK_TURN_ID_ATTR, host.getAttribute(DEEPSEEK_TURN_ID_ATTR) || turnId);
+        }
+        return "";
     }
     function resolveCodeLanguage(codeNode) {
         let current = codeNode.parentElement;
@@ -1990,7 +2463,7 @@
         });
         return assets;
     }
-    function collectConversation() {
+    function collectChatGPTConversation() {
         const turns = resolveTurns();
         const messages = [];
         let userMessageIndex = 0;
@@ -2006,6 +2479,8 @@
                     messages.push({
                         id: `${turnId}:user`,
                         turnId,
+                        platform: "chatgpt",
+                        assistantLabel: "gpt",
                         index: userMessageIndex,
                         role: "user",
                         text,
@@ -2034,6 +2509,8 @@
             messages.push({
                 id: `${turnId}:assistant`,
                 turnId,
+                platform: "chatgpt",
+                assistantLabel: "gpt",
                 index: assistantMessageIndex,
                 role: "assistant",
                 text,
@@ -2048,9 +2525,85 @@
                 url: window.location.href,
                 exportedAt: new Date().toISOString(),
                 messageCount: messages.length,
+                platform: "chatgpt",
             },
             messages,
         };
+    }
+    function collectDeepSeekConversation() {
+        const items = resolveDeepSeekMessageHosts();
+        const messages = [];
+        let userMessageIndex = 0;
+        let assistantMessageIndex = 0;
+        items.forEach((item) => {
+            const host = item.host;
+            const role = item.role;
+            const body = resolveDeepSeekMessageBody(host, role) || item.body || host;
+            if (!(host instanceof HTMLElement) || !(body instanceof HTMLElement)) {
+                return;
+            }
+            const turnId = ensureDeepSeekTurnId(host);
+            const assets = extractMessageAssets(host, body);
+            if (role === "user") {
+                const text = normalizeWhitespace(body.innerText || body.textContent || "");
+                if (!text && !assets.length) {
+                    return;
+                }
+                userMessageIndex += 1;
+                messages.push({
+                    id: `${turnId}:user`,
+                    turnId,
+                    platform: "deepseek",
+                    assistantLabel: "deepseek",
+                    hostSelectorHint: buildDeepSeekHostSelectorHint(host, body, turnId),
+                    index: userMessageIndex,
+                    role: "user",
+                    text,
+                    markdown: text,
+                    html: body.innerHTML,
+                    assets,
+                });
+                return;
+            }
+            if (role !== "assistant") {
+                return;
+            }
+            const markdown = serializeAssistantMarkdown(body);
+            const text = normalizeWhitespace(body.innerText || markdown);
+            if (!text && !markdown && !assets.length) {
+                return;
+            }
+            assistantMessageIndex += 1;
+            messages.push({
+                id: `${turnId}:assistant`,
+                turnId,
+                platform: "deepseek",
+                assistantLabel: "deepseek",
+                hostSelectorHint: buildDeepSeekHostSelectorHint(host, body, turnId),
+                index: assistantMessageIndex,
+                role: "assistant",
+                text,
+                markdown: markdown || text,
+                html: body.innerHTML,
+                assets,
+            });
+        });
+        return {
+            metadata: {
+                title: cleanConversationTitle(),
+                url: window.location.href,
+                exportedAt: new Date().toISOString(),
+                messageCount: messages.length,
+                platform: "deepseek",
+            },
+            messages,
+        };
+    }
+    function collectConversation() {
+        if (isDeepSeekPage()) {
+            return collectDeepSeekConversation();
+        }
+        return collectChatGPTConversation();
     }
     function applySelection(conversation) {
         if (!selectionLoaded) {
@@ -2250,14 +2803,31 @@
             .map((entry) => entry && typeof entry.name === "string" ? entry.name : "")
             .filter(Boolean));
     }
-    function findTurnElement(turnId) {
+    function findTurnElement(turnId, message) {
+        if (message && message.platform === "deepseek") {
+            const hinted = querySelectorSafely(message.hostSelectorHint || "");
+            if (hinted instanceof HTMLElement) {
+                return hinted;
+            }
+            if (turnId) {
+                const cachedTurn = deepSeekTurnHostCache.get(turnId);
+                if (cachedTurn instanceof HTMLElement && cachedTurn.isConnected) {
+                    return cachedTurn;
+                }
+                const byTurnId = querySelectorSafely(buildAttributeSelector(DEEPSEEK_TURN_ID_ATTR, turnId));
+                if (byTurnId instanceof HTMLElement) {
+                    return byTurnId;
+                }
+            }
+            return null;
+        }
         if (!turnId) {
             return null;
         }
-        return document.querySelector(`section[data-testid="${turnId}"]`);
+        return document.querySelector(`section${buildAttributeSelector("data-testid", turnId)}`);
     }
     function findAttachmentTrigger(message, asset) {
-        const turn = findTurnElement(message.turnId);
+        const turn = findTurnElement(message.turnId, message);
         if (!(turn instanceof HTMLElement)) {
             return null;
         }
@@ -2463,7 +3033,9 @@
             return "";
         }
         const beforeResources = getResourceEntryNames();
-        const beforeDirectUrl = findDirectAssetUrl(trigger.closest("section") || trigger);
+        const turn = findTurnElement(message.turnId, message);
+        const scope = trigger.closest("section") || turn || trigger;
+        const beforeDirectUrl = findDirectAssetUrl(scope);
         if (beforeDirectUrl) {
             return beforeDirectUrl;
         }
@@ -2472,7 +3044,7 @@
         triggerNativeDownloadElement(trigger);
         for (let attempt = 0; attempt < 12; attempt += 1) {
             await delay(250);
-            const scopedUrl = findDirectAssetUrl(trigger.closest("section") || trigger);
+            const scopedUrl = findDirectAssetUrl(scope);
             if (scopedUrl) {
                 return scopedUrl;
             }
@@ -2773,7 +3345,13 @@
             ? `已触发 ${primedNativeDownloads} 个附件的浏览器原生下载，正在整理导出数据…`
             : "正在整理导出数据…", "muted");
         try {
-            latestConversation = collectConversation();
+            const wasFullySelected = selectionLoaded && isEveryMessageSelected(latestConversation);
+            latestConversation = await collectConversationForAction({
+                loadHistory: isDeepSeekPage(),
+            });
+            if (selectionLoaded && wasFullySelected) {
+                selectedMessageIds = new Set(latestConversation.messages.map((message) => message.id));
+            }
             const conversation = applySelection(latestConversation);
             if (!conversation.messages.length) {
                 throw new Error("当前没有可导出的消息。请先刷新消息列表并至少勾选一条消息。");
@@ -2823,6 +3401,9 @@
         }
     }
     function start() {
+        if (!isSupportedConversationPage()) {
+            return;
+        }
         installPageHookBridge();
         injectPageHook();
         ensurePanel();

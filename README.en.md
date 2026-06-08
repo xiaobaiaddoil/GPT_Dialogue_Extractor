@@ -2,8 +2,8 @@
 
 # GPT Dialogue Extractor
 
-A browser extension for exporting the current ChatGPT conversation.  
-It reads the rendered conversation directly from `chatgpt.com` and exports it to local files.
+A browser extension for exporting the current ChatGPT and DeepSeek web conversation.
+It reads the rendered conversation directly from the page and exports it to local files.
 
 <p>
   <a href="./README.md">
@@ -22,10 +22,9 @@ It reads the rendered conversation directly from `chatgpt.com` and exports it to
 - Export the current conversation as `JSON`
 - Export the current conversation as `Markdown`
 - Export the current conversation as `PDF`
+- Export the current conversation as `ZIP`, including readable images and attachments when available
 - Choose a custom save location
 - Select which messages to export
-- Load older history before export
-- Restore the reading position after export preparation
 - Export code blocks
 - Export common formulas
 - Right-side user-message timeline with hover preview and jump navigation
@@ -52,10 +51,12 @@ It reads the rendered conversation directly from `chatgpt.com` and exports it to
 
 ### 1. Open a conversation page
 
-Open any ChatGPT conversation page:
+Open any ChatGPT or DeepSeek conversation page:
 
 - `https://chatgpt.com/*`
 - `https://chat.openai.com/*`
+- `https://chat.deepseek.com/*`
+- `https://www.deepseek.com/chat*`
 
 The extension injects itself automatically.
 
@@ -81,11 +82,12 @@ If no message is selected, export will fail.
 
 ### 4. Choose an export format
 
-The panel provides three formats:
+The panel provides four formats:
 
 - `导出 JSON`
 - `导出 Markdown`
 - `导出 PDF`
+- `导出 ZIP`
 
 #### JSON
 
@@ -101,6 +103,10 @@ Best for saving and sharing.
 
 The current PDF export does not use the browser print dialog. The extension generates the PDF directly and downloads it, which makes it less likely to be affected by print-blocking extensions.
 
+#### ZIP
+
+Best for complete archiving. The ZIP contains `conversation.json`, `conversation.md`, a bundle manifest, and any images or attachments that can be read directly.
+
 ### 5. Save the file
 
 After clicking export, the browser opens a save dialog.
@@ -111,11 +117,11 @@ You can:
 - rename the file
 - confirm the download
 
-### 6. History loading behavior
+### 6. Current Read Scope
 
-If older messages have not been fully loaded in the page yet, the extension will load them before export.
+The extension only reads messages that are already rendered in the current page DOM.
 
-After that, it tries to restore your previous reading position instead of leaving the page at the top.
+If older messages in a long conversation are not loaded yet, scroll to them in the web app first, then export or refresh the list.
 
 ### 7. Use the timeline
 
@@ -152,7 +158,7 @@ If you change the extension code, do these three steps:
 
 1. run `npm run build`
 2. refresh the extension in the extensions page
-3. refresh the ChatGPT tab itself
+3. refresh the ChatGPT or DeepSeek tab itself
 
 Otherwise the browser may still be running an older content script.
 
@@ -176,4 +182,4 @@ Related docs:
 - Table export is not yet high fidelity
 - PDF currently prioritizes reliable export over exact visual reproduction
 
-If your goal is to reliably export the current ChatGPT conversation to local files, this version is already usable.
+If your goal is to reliably export the current ChatGPT or DeepSeek web conversation to local files, this version is already usable.

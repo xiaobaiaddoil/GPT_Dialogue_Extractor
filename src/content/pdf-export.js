@@ -112,7 +112,9 @@
         return blocks;
     }
     function getMessageDisplayName(message) {
-        return `${message.role === "user" ? "user" : "gpt"}${message.index}`;
+        const assistantLabel = message.assistantLabel ||
+            (message.platform === "deepseek" ? "deepseek" : "gpt");
+        return `${message.role === "user" ? "user" : assistantLabel}${message.index}`;
     }
     function renderConversationPdfPages(conversation) {
         const pageWidth = 1240;
